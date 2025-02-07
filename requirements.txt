@@ -1,0 +1,5 @@
+selenium
+gym
+numpy
+torch
+chromedriver-autoinstaller
