@@ -4,12 +4,16 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.optimizers import Adam
 import time
 import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
 import os
 import pickle
+import random
 
 
 class DinoAI:
@@ -17,16 +21,27 @@ class DinoAI:
         self.memory = deque(maxlen=2000)
         self.learning_rate = 0.001
         self.gamma = 0.95
-        self.epsilon = 1.0
+        self.epsilon = 0.9
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.999  # 降低衰减速度
         self.scores = []
+        self.model = self._build_model()
 
         # 加载之前的训练数据
         self.load_progress()
 
+    def _build_model(self):
+        model = Sequential([
+            Dense(24, input_dim=5, activation='relu'),
+            Dense(24, activation='relu'),
+            Dense(2, activation='linear')
+        ])
+        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+        return model
+
     def save_progress(self):
         # 保存AI的状态
+        self.model.save('dino_model.h5')
         state = {
             'memory': self.memory,
             'epsilon': self.epsilon,
@@ -37,8 +52,9 @@ class DinoAI:
 
     def load_progress(self):
         # 加载之前的训练状态
-        if os.path.exists('dino_ai_state.pkl'):
+        if os.path.exists('dino_ai_state.pkl') and os.path.exists('dino_model.h5'):
             try:
+                self.model = load_model('dino_model.h5')
                 with open('dino_ai_state.pkl', 'rb') as f:
                     state = pickle.load(f)
                 self.memory = state['memory']
@@ -50,19 +66,27 @@ class DinoAI:
 
     def get_state(self, game_state):
         if not game_state['obstacles']:
-            return np.zeros(3)
+            return np.zeros(5)
+
         obstacle = game_state['obstacles'][0]
-        return np.array([
-            obstacle['x'] / 600,
-            obstacle['width'] / 60,
-            game_state['speed'] / 13
+        # 如果有第二个障碍物，也考虑进去
+        next_obstacle = game_state['obstacles'][1] if len(game_state['obstacles']) > 1 else None
+
+        state = np.array([
+            obstacle['x'] / 600,  # 第一个障碍物距离
+            obstacle['width'] / 60,  # 第一个障碍物宽度
+            next_obstacle['x'] / 600 if next_obstacle else 2.0,  # 第二个障碍物距离（如果存在）
+            game_state['speed'] / 13,  # 游戏速度
+            float(game_state.get('jumping', False))  # 恐龙是否在跳跃
         ])
+        return state
 
     def act(self, state):
         if np.random.rand() <= self.epsilon:
             return np.random.choice([True, False])
-        distance = state[0] * 600
-        return 100 < distance < 200
+
+        act_values = self.model.predict(state.reshape(1, -1), verbose=0)
+        return bool(np.argmax(act_values[0]))
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
@@ -70,6 +94,33 @@ class DinoAI:
     def train(self):
         if len(self.memory) < 32:
             return
+
+        # 从记忆中随机采样进行训练
+        minibatch = random.sample(self.memory, 32)
+
+        states = np.array([x[0] for x in minibatch])
+        next_states = np.array([x[3] for x in minibatch])
+
+        # 预测当前状态和下一状态的Q值
+        current_q = self.model.predict(states, verbose=0)
+        next_q = self.model.predict(next_states, verbose=0)
+
+        # 准备训练数据
+        X = []
+        y = []
+
+        for i, (state, action, reward, next_state, done) in enumerate(minibatch):
+            target = reward
+            if not done:
+                target += self.gamma * np.amax(next_q[i])
+
+            target_f = current_q[i]
+            target_f[1 if action else 0] = target
+
+            X.append(state)
+            y.append(target_f)
+
+        self.model.fit(np.array(X), np.array(y), epochs=1, verbose=0)
 
 
 def init_game():
@@ -111,6 +162,7 @@ def init_game():
         driver.quit()
         return None, None
 
+
 def get_game_state(driver):
     state = driver.execute_script("""
         return {
@@ -118,6 +170,7 @@ def get_game_state(driver):
             playing: Runner.instance_.playing,
             speed: Runner.instance_.currentSpeed,
             score: Runner.instance_.distanceMeter.digits,
+            jumping: Runner.instance_.tRex.jumping,
             obstacles: Runner.instance_.horizon.obstacles.map(o => ({
                 x: o.xPos,
                 y: o.yPos,
@@ -128,6 +181,28 @@ def get_game_state(driver):
         }
     """)
     return state
+
+
+def calculate_reward(state, score, last_score):
+    if state['crashed']:
+        return -10
+
+    # 计算增量奖励
+    score_reward = (score - last_score) * 0.1
+
+    # 如果有障碍物，根据跳跃决策给予奖励
+    if state['obstacles']:
+        obstacle = state['obstacles'][0]
+        distance = obstacle['x']
+
+        # 在合适的距离跳跃给予奖励
+        if state['jumping'] and 100 < distance < 200:
+            return 1 + score_reward
+        # 在障碍物很远时跳跃给予惩罚
+        elif state['jumping'] and distance > 300:
+            return -0.5 + score_reward
+
+    return 0.1 + score_reward  # 基础存活奖励
 
 
 def save_training_data(ai):
@@ -157,6 +232,7 @@ def main():
             print(f"第 {episode} 回合开始...")
             actions = ActionChains(driver)
             current_score = 0
+            last_score = 0
             last_state = None
             last_action = None
 
@@ -164,6 +240,7 @@ def main():
                 try:
                     state = get_game_state(driver)
                     current_state = ai.get_state(state)
+                    current_score = int(''.join(map(str, state['score'])))
 
                     if state['crashed']:
                         ai.scores.append(current_score)
@@ -174,7 +251,8 @@ def main():
                             print(f"游戏结束，得分：{current_score}，最佳记录：{best_score}")
 
                         if last_state is not None:
-                            ai.remember(last_state, last_action, -1, current_state, True)
+                            reward = calculate_reward(state, current_score, last_score)
+                            ai.remember(last_state, last_action, reward, current_state, True)
 
                         # 每回合都保存进度
                         ai.save_progress()
@@ -187,13 +265,12 @@ def main():
                         actions.send_keys(Keys.SPACE).perform()
 
                     if last_state is not None:
-                        reward = 1
+                        reward = calculate_reward(state, current_score, last_score)
                         ai.remember(last_state, last_action, reward, current_state, False)
 
                     last_state = current_state
                     last_action = should_jump
-
-                    current_score = int(''.join(map(str, state['score'])))
+                    last_score = current_score
 
                     ai.train()
 
@@ -205,6 +282,7 @@ def main():
 
             driver.quit()
 
+            # 更新探索率
             ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
 
     except KeyboardInterrupt:
