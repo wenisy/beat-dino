@@ -5,15 +5,19 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Dense, Input
 from tensorflow.keras.optimizers import Adam
 import time
 import numpy as np
 from collections import deque
 import matplotlib.pyplot as plt
+import tensorflow as tf
 import os
 import pickle
 import random
+import warnings
+
+warnings.filterwarnings('ignore', category=Warning)
 
 
 class DinoAI:
@@ -25,43 +29,60 @@ class DinoAI:
         self.epsilon_min = 0.01
         self.epsilon_decay = 0.999
         self.scores = []
+        self.save_dir = os.path.dirname(os.path.abspath(__file__))
+        # 使用 .keras 扩展名
+        self.model_path = os.path.join(self.save_dir, 'dino_model.keras')
+        self.state_path = os.path.join(self.save_dir, 'dino_ai_state.pkl')
         self.model = self._build_model()
 
         # 加载之前的训练数据
         self.load_progress()
 
     def _build_model(self):
-        model = Sequential([
-            Dense(32, input_dim=5, activation='relu'),  # 增加神经元数量
-            Dense(32, activation='relu'),
-            Dense(32, activation='relu'),  # 增加一层
-            Dense(2, activation='linear')
-        ])
-        model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
+        model = Sequential()
+        model.add(Input(shape=(5,)))
+        model.add(Dense(32, activation='relu'))
+        model.add(Dense(32, activation='relu'))
+        model.add(Dense(32, activation='relu'))
+        model.add(Dense(2, activation='linear'))
+        # 将 'mse' 改为 tf.keras.losses.MeanSquaredError()
+        model.compile(
+            loss=tf.keras.losses.MeanSquaredError(),
+            optimizer=Adam(learning_rate=self.learning_rate)
+        )
         return model
 
     def save_progress(self):
-        self.model.save('dino_model.h5')
+        # 保存模型
+        tf.keras.models.save_model(self.model, self.model_path)
         state = {
             'memory': self.memory,
             'epsilon': self.epsilon,
             'scores': self.scores
         }
-        with open('dino_ai_state.pkl', 'wb') as f:
+        with open(self.state_path, 'wb') as f:
             pickle.dump(state, f)
 
     def load_progress(self):
-        if os.path.exists('dino_ai_state.pkl') and os.path.exists('dino_model.h5'):
-            try:
-                self.model = load_model('dino_model.h5')
-                with open('dino_ai_state.pkl', 'rb') as f:
-                    state = pickle.load(f)
-                self.memory = state['memory']
-                self.epsilon = state['epsilon']
-                self.scores = state['scores']
-                print(f"加载已有进度: 已训练 {len(self.scores)} 回合")
-            except:
-                print("无法加载之前的进度，将重新开始训练")
+        try:
+            if os.path.exists(self.model_path) and os.path.exists(self.state_path):
+                try:
+                    self.model = tf.keras.models.load_model(self.model_path)
+                    with open(self.state_path, 'rb') as f:
+                        state = pickle.load(f)
+                    self.memory = state['memory']
+                    self.epsilon = state['epsilon']
+                    self.scores = state['scores']
+                    print(f"成功加载已有进度: 已训练 {len(self.scores)} 回合")
+                except Exception as e:
+                    print(f"加载进度时出错: {str(e)}")
+                    print("将重新开始训练")
+            else:
+                print(f"未找到进度文件 ({self.model_path} 或 {self.state_path})")
+                print("将重新开始训练")
+        except Exception as e:
+            print(f"加载进度时发生异常: {str(e)}")
+            print("将重新开始训练")
 
     def get_state(self, game_state):
         if not game_state['obstacles']:
@@ -124,7 +145,9 @@ def init_game():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=800,600")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    # options.add_argument("--headless")  # 启用无界面模式
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
     print("正在启动 Chrome...")
     driver = webdriver.Chrome(options=options)
