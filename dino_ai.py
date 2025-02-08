@@ -145,9 +145,9 @@ def init_game():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=800,600")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
+    # options.add_argument("--headless=new")
+    # options.add_argument("--no-sandbox")
+    # options.add_argument("--disable-dev-shm-usage")
 
     print("正在启动 Chrome...")
     driver = webdriver.Chrome(options=options)
