@@ -166,7 +166,7 @@ def init_game():
     time.sleep(3)
     try:
         print("正在查找游戏元素...")
-        canvas = WebDriverWait(driver, 10).until(
+        canvas = WebDriverWait(driver, 2).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".runner-container .runner-canvas"))
         )
         print("正在开始游戏...")
