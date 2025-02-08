@@ -159,7 +159,7 @@ def init_game():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=800,600")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--headless")  # 如果需要，可启用无头模式：
+    # options.add_argument("--headless")  # 如果需要，可启用无头模式：
     driver = webdriver.Chrome(options=options)
     print("正在启动 Chrome...")
     driver.get("https://trex-runner.com/")
