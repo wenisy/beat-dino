@@ -233,7 +233,7 @@ def save_training_data(ai):
     window_size = 10
     moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid')
     plt.figure(figsize=(12, 6))
-    plt.plot(scores, alpha=0.3, label='Original Scores')
+    plt.plot(scores, alpha=0.3, label='Score')
     plt.plot(moving_avg, label=f'{window_size}Moving Avg')
     plt.title('Progress')
     plt.xlabel('Rounds')
