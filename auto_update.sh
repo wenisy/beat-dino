@@ -12,7 +12,7 @@ TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 # 执行git操作
 git add .
 git commit -m "Auto commit at $TIMESTAMP"
-git push origin master
+git push origin main
 
 # 记录日志
 echo "Executed git operations at $TIMESTAMP" >> "$REPO_DIR/git-auto-commit.log"
