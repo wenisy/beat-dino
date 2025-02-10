@@ -27,13 +27,15 @@ class DinoAI:
         self.learning_rate = 0.001
         self.gamma = 0.95
         self.epsilon = 1.0  # 初始探索率设为1.0，全面探索
-        self.epsilon_min = 0.05  # 提高最低探索率，确保后期仍有一定随机性
+        self.epsilon_min = 0.05  # 保证后期仍有一定随机性
         self.epsilon_decay = 0.995  # 每回合后乘以0.995，使探索率逐渐下降
         self.scores = []
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
         # 使用 .keras 扩展名保存模型
         self.model_path = os.path.join(self.save_dir, 'dino_model.keras')
         self.state_path = os.path.join(self.save_dir, 'dino_ai_state.pkl')
+        # 为加速度信息初始化 last_speed
+        self.last_speed = 0
         self.model = self._build_model()
         # 初始化目标网络并同步权重
         self.target_model = clone_model(self.model)
@@ -42,9 +44,9 @@ class DinoAI:
         self.load_progress()
 
     def _build_model(self):
-        # 状态维度调整为6（增加了障碍物高度）
+        # 状态维度更新为7（原6维，加上加速度）
         model = Sequential()
-        model.add(Input(shape=(6,)))
+        model.add(Input(shape=(7,)))
         model.add(Dense(64, activation='relu'))
         model.add(Dense(64, activation='relu'))
         model.add(Dense(64, activation='relu'))
@@ -88,37 +90,52 @@ class DinoAI:
             print("未找到进度文件，将重新开始训练")
 
     def get_state(self, game_state):
-        # 如果没有障碍物，返回零状态（6维）
+        """
+        构建状态向量：
+          1. 障碍物距离（obs_x / 600）
+          2. 障碍物宽度（obs_width / 60）
+          3. 障碍物高度（obs_height / 50）
+          4. 下一个障碍物距离（next_x / 600）
+          5. 当前速度（speed / 13）
+          6. 是否在跳跃（float(jumping)）
+          7. 当前加速度（(speed - last_speed) / 5）
+        """
+        # 如果没有障碍物，返回零状态（7维）
         if not game_state['obstacles']:
-            return np.zeros(6)
+            # 同时更新 last_speed 为当前速度
+            current_speed = game_state.get('speed') if game_state.get('speed') is not None else 0
+            self.last_speed = current_speed
+            return np.zeros(7)
 
         # 取第一个障碍物，并用字典的 get 方法设置默认值（如果属性为 None，则用 0）
         obstacle = game_state['obstacles'][0]
         next_obstacle = game_state['obstacles'][1] if len(game_state['obstacles']) > 1 else None
 
-        # 对各个属性做安全检查：如果属性为 None，则用默认值 0（或其他合理值）
         obs_x = obstacle.get('x') if obstacle.get('x') is not None else 0
         obs_width = obstacle.get('width') if obstacle.get('width') is not None else 0
         obs_height = obstacle.get('height') if obstacle.get('height') is not None else 0
 
-        # 对下一个障碍物，同样处理。如果没有下一个障碍物，默认设置为 2.0（后面再归一化）
         if next_obstacle is not None:
             next_x = next_obstacle.get('x') if next_obstacle.get('x') is not None else 0
         else:
             next_x = 2.0
 
-        # 游戏速度同理
         speed = game_state.get('speed') if game_state.get('speed') is not None else 0
-
         jumping = game_state.get('jumping', False)
+
+        # 计算加速度：当前速度与上一次速度的差值；归一化除以5（可根据实际情况调整）
+        acceleration = (speed - self.last_speed) / 5.0
+        # 更新 last_speed
+        self.last_speed = speed
 
         state = np.array([
             obs_x / 600,
             obs_width / 60,
             obs_height / 50,
-            next_x / 600,  # 如果没有下一个障碍物，next_x 已经设为 2.0
+            next_x / 600,
             speed / 13,
-            float(jumping)
+            float(jumping),
+            acceleration
         ])
         return state
 
@@ -138,7 +155,6 @@ class DinoAI:
         states = np.array([x[0] for x in minibatch])
         next_states = np.array([x[3] for x in minibatch])
         current_q = self.model.predict(states, verbose=0)
-        # 用目标网络计算下一状态的 Q 值，提高训练稳定性
         next_q = self.target_model.predict(next_states, verbose=0)
         X, y = [], []
         for i, (state, action, reward, next_state, done) in enumerate(minibatch):
@@ -146,7 +162,6 @@ class DinoAI:
             if not done:
                 target += self.gamma * np.amax(next_q[i])
             target_f = current_q[i]
-            # action 为布尔值：True 表示跳跃，对应索引1；False 表示不跳，对应索引0
             target_f[1 if action else 0] = target
             X.append(state)
             y.append(target_f)
@@ -221,7 +236,6 @@ def calculate_reward(state, score, last_score):
                 reward -= 2
         elif 50 < distance < 100:
             reward -= 1
-    # 增加生存奖励和分数提升奖励（将分数部分奖励从0.2调为0.3）
     reward += 0.1
     reward += (score - last_score) * 0.3
     return reward
@@ -312,7 +326,7 @@ def main():
                     print(f"回合中发生错误: {e}")
                     break
             driver.quit()
-            # 每回合后更新探索率，并周期性重置一定的探索率（例如每500回合至少保持0.1）
+            # 更新探索率，并周期性保证一定的探索
             ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
             if episode % 500 == 0:
                 ai.epsilon = max(ai.epsilon, 0.1)
