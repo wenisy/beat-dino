@@ -5,7 +5,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from tensorflow.keras.models import Sequential, load_model, clone_model
-from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.layers import Dense, Input, Dropout
 from tensorflow.keras.optimizers import Adam
 import time
 import numpy as np
@@ -22,47 +22,44 @@ warnings.filterwarnings('ignore', category=Warning)
 
 class DinoAI:
     def __init__(self):
-        # 增大经验回放池的容量
-        self.memory = deque(maxlen=10000)
-        self.learning_rate = 0.001
-        self.gamma = 0.95
-        self.epsilon = 1.0  # 初始探索率设为1.0，全面探索
-        self.epsilon_min = 0.05  # 保证后期仍有一定随机性
-        self.epsilon_decay = 0.995  # 每回合后乘以0.995，使探索率逐渐下降
+        self.memory = deque(maxlen=20000)
+        self.learning_rate = 0.0005
+        self.gamma = 0.99
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9975
         self.scores = []
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
-        # 使用 .keras 扩展名保存模型
         self.model_path = os.path.join(self.save_dir, 'dino_model.keras')
         self.state_path = os.path.join(self.save_dir, 'dino_ai_state.pkl')
-        # 为加速度信息初始化 last_speed
         self.last_speed = 0
         self.model = self._build_model()
-        # 初始化目标网络并同步权重
         self.target_model = clone_model(self.model)
         self.target_model.set_weights(self.model.get_weights())
-        # 加载之前的训练数据（如果存在）
         self.load_progress()
 
     def _build_model(self):
-        # 状态维度更新为7（原6维，加上加速度）
-        model = Sequential()
-        model.add(Input(shape=(7,)))
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(64, activation='relu'))
-        model.add(Dense(2, activation='linear'))
+        model = Sequential([
+            Input(shape=(9,)),
+            Dense(128, activation='relu'),
+            Dropout(0.1),
+            Dense(256, activation='relu'),
+            Dense(256, activation='relu'),
+            Dropout(0.1),
+            Dense(128, activation='relu'),
+            Dense(64, activation='relu'),
+            Dense(2, activation='linear')
+        ])
         model.compile(
-            loss=tf.keras.losses.MeanSquaredError(),
+            loss=tf.keras.losses.Huber(),
             optimizer=Adam(learning_rate=self.learning_rate)
         )
         return model
 
     def update_target_model(self):
-        # 将目标网络权重更新为当前模型的权重
         self.target_model.set_weights(self.model.get_weights())
 
     def save_progress(self):
-        # 保存模型和状态（记忆池、epsilon、得分历史）
         tf.keras.models.save_model(self.model, self.model_path)
         state = {
             'memory': self.memory,
@@ -90,54 +87,81 @@ class DinoAI:
             print("未找到进度文件，将重新开始训练")
 
     def get_state(self, game_state):
-        """
-        构建状态向量：
-          1. 障碍物距离（obs_x / 600）
-          2. 障碍物宽度（obs_width / 60）
-          3. 障碍物高度（obs_height / 50）
-          4. 下一个障碍物距离（next_x / 600）
-          5. 当前速度（speed / 13）
-          6. 是否在跳跃（float(jumping)）
-          7. 当前加速度（(speed - last_speed) / 5）
-        """
-        # 如果没有障碍物，返回零状态（7维）
-        if not game_state['obstacles']:
-            # 同时更新 last_speed 为当前速度
-            current_speed = game_state.get('speed') if game_state.get('speed') is not None else 0
-            self.last_speed = current_speed
-            return np.zeros(7)
+        try:
+            # 基础检查
+            if not game_state or not isinstance(game_state, dict):
+                return np.zeros(9)
 
-        # 取第一个障碍物，并用字典的 get 方法设置默认值（如果属性为 None，则用 0）
-        obstacle = game_state['obstacles'][0]
-        next_obstacle = game_state['obstacles'][1] if len(game_state['obstacles']) > 1 else None
+            # 获取障碍物信息
+            obstacles = game_state.get('obstacles', [])
+            if not obstacles:
+                return np.zeros(9)
 
-        obs_x = obstacle.get('x') if obstacle.get('x') is not None else 0
-        obs_width = obstacle.get('width') if obstacle.get('width') is not None else 0
-        obs_height = obstacle.get('height') if obstacle.get('height') is not None else 0
+            # 安全地获取第一个障碍物
+            obstacle = obstacles[0]
+            if not isinstance(obstacle, dict):
+                return np.zeros(9)
 
-        if next_obstacle is not None:
-            next_x = next_obstacle.get('x') if next_obstacle.get('x') is not None else 0
-        else:
-            next_x = 2.0
+            # 安全地获取第二个障碍物
+            next_obstacle = obstacles[1] if len(obstacles) > 1 else None
 
-        speed = game_state.get('speed') if game_state.get('speed') is not None else 0
-        jumping = game_state.get('jumping', False)
+            # 安全地获取所有必要的值，使用默认值
+            try:
+                obs_x = float(obstacle.get('x', 0))
+            except (ValueError, TypeError):
+                obs_x = 0.0
 
-        # 计算加速度：当前速度与上一次速度的差值；归一化除以5（可根据实际情况调整）
-        acceleration = (speed - self.last_speed) / 5.0
-        # 更新 last_speed
-        self.last_speed = speed
+            try:
+                obs_width = float(obstacle.get('width', 0))
+            except (ValueError, TypeError):
+                obs_width = 0.0
 
-        state = np.array([
-            obs_x / 600,
-            obs_width / 60,
-            obs_height / 50,
-            next_x / 600,
-            speed / 13,
-            float(jumping),
-            acceleration
-        ])
-        return state
+            try:
+                obs_height = float(obstacle.get('height', 0))
+            except (ValueError, TypeError):
+                obs_height = 0.0
+
+            try:
+                next_x = float(next_obstacle.get('x', 600)) if next_obstacle else 600.0
+            except (ValueError, TypeError):
+                next_x = 600.0
+
+            try:
+                speed = float(game_state.get('speed', 1))
+            except (ValueError, TypeError):
+                speed = 1.0
+
+            jumping = bool(game_state.get('jumping', False))
+
+            # 计算加速度
+            try:
+                acceleration = (speed - self.last_speed) / 5.0
+            except (ValueError, TypeError):
+                acceleration = 0.0
+            self.last_speed = speed
+
+            # 创建状态向量
+            state = np.array([
+                obs_x / 600.0,
+                obs_width / 60.0,
+                obs_height / 50.0,
+                next_x / 600.0,
+                speed / 13.0,
+                float(jumping),
+                acceleration,
+                (obs_x / speed) if speed > 0 else 0.0,
+                1.0 if obs_height > 40 else 0.0
+            ], dtype=np.float32)
+
+            # 确保所有值都在合理范围内
+            state = np.clip(state, -1.0, 1.0)
+            state = np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            return state
+
+        except Exception as e:
+            print(f"状态生成错误: {e}")
+            return np.zeros(9)
 
     def act(self, state):
         if np.random.rand() <= self.epsilon:
@@ -148,14 +172,19 @@ class DinoAI:
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
 
-    def train(self, batch_size=64):
+    def train(self, batch_size=128):
         if len(self.memory) < batch_size:
             return
-        minibatch = random.sample(self.memory, batch_size)
+
+        indices = np.random.choice(len(self.memory), batch_size, replace=False)
+        minibatch = [self.memory[i] for i in indices]
+
         states = np.array([x[0] for x in minibatch])
         next_states = np.array([x[3] for x in minibatch])
+
         current_q = self.model.predict(states, verbose=0)
         next_q = self.target_model.predict(next_states, verbose=0)
+
         X, y = [], []
         for i, (state, action, reward, next_state, done) in enumerate(minibatch):
             target = reward
@@ -165,7 +194,42 @@ class DinoAI:
             target_f[1 if action else 0] = target
             X.append(state)
             y.append(target_f)
-        self.model.fit(np.array(X), np.array(y), epochs=1, verbose=0)
+
+        self.model.fit(np.array(X), np.array(y), epochs=2, batch_size=32, verbose=0)
+
+
+def calculate_reward(state, score, last_score):
+    if state['crashed']:
+        return -20
+
+    reward = 0
+    if state['obstacles']:
+        obstacle = state['obstacles'][0]
+        distance = obstacle['x']
+
+        if state['jumping']:
+            if 80 < distance < 160:
+                reward += 3
+            elif 160 < distance < 250:
+                reward -= 1
+            elif distance < 80:
+                reward -= 2
+        else:
+            if distance < 80:
+                reward -= 2
+            elif 80 < distance < 160:
+                reward += 0.5
+
+    reward += 0.1
+
+    score_diff = score - last_score
+    if score_diff > 0:
+        reward += score_diff * 0.5
+
+    if state.get('speed', 0) > 10:
+        reward += 0.2
+
+    return reward
 
 
 def init_game():
@@ -174,19 +238,26 @@ def init_game():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=800,600")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--headless")  # 启用无头模式
+    options.add_argument("--headless")
     driver = webdriver.Chrome(options=options)
     print("正在启动 Chrome...")
     driver.get("https://trex-runner.com/")
-    time.sleep(3)
+    time.sleep(5)  # 增加等待时间
     try:
         print("正在查找游戏元素...")
-        canvas = WebDriverWait(driver, 2).until(
+        canvas = WebDriverWait(driver, 10).until(  # 增加等待时间
             EC.presence_of_element_located((By.CSS_SELECTOR, ".runner-container .runner-canvas"))
         )
         print("正在开始游戏...")
         canvas.click()
-        time.sleep(1)
+        time.sleep(2)
+
+        # 确保游戏已经完全加载
+        ready = driver.execute_script("return typeof Runner !== 'undefined' && Runner.instance_ !== null")
+        if not ready:
+            print("游戏未完全加载，等待中...")
+            time.sleep(3)
+
         actions = ActionChains(driver)
         actions.send_keys(Keys.SPACE)
         actions.perform()
@@ -199,46 +270,76 @@ def init_game():
 
 
 def get_game_state(driver):
-    # 通过 JavaScript 获取游戏状态信息
-    state = driver.execute_script("""
-        return {
-            crashed: Runner.instance_.crashed,
-            playing: Runner.instance_.playing,
-            speed: Runner.instance_.currentSpeed,
-            score: Runner.instance_.distanceMeter.digits,
-            jumping: Runner.instance_.tRex.jumping,
-            obstacles: Runner.instance_.horizon.obstacles.map(o => ({
-                x: o.xPos,
-                y: o.yPos,
-                width: o.width,
-                height: o.height,
-                type: o.typeConfig.type
-            }))
+    try:
+        state = driver.execute_script("""
+            if (typeof Runner === 'undefined' || !Runner.instance_) {
+                return null;
+            }
+
+            var runner = Runner.instance_;
+            var obstacles = [];
+
+            try {
+                obstacles = runner.horizon.obstacles.map(function(o) {
+                    return {
+                        x: o.xPos || 0,
+                        y: o.yPos || 0,
+                        width: o.width || 0,
+                        height: o.height || 0,
+                        type: o.typeConfig ? o.typeConfig.type : 'unknown'
+                    };
+                });
+            } catch (e) {
+                obstacles = [];
+            }
+
+            return {
+                crashed: Boolean(runner.crashed),
+                playing: Boolean(runner.playing),
+                speed: Number(runner.currentSpeed) || 0,
+                score: Array.isArray(runner.distanceMeter.digits) ? runner.distanceMeter.digits : [0],
+                jumping: Boolean(runner.tRex.jumping),
+                obstacles: obstacles
+            };
+        """)
+
+        if not state:
+            return {
+                'crashed': False,
+                'playing': False,
+                'speed': 0,
+                'score': [0],
+                'jumping': False,
+                'obstacles': []
+            }
+
+        # 确保返回的状态包含所有必要的字段
+        default_state = {
+            'crashed': False,
+            'playing': False,
+            'speed': 0,
+            'score': [0],
+            'jumping': False,
+            'obstacles': []
         }
-    """)
-    return state
 
+        # 合并返回的状态和默认状态
+        for key in default_state:
+            if key not in state or state[key] is None:
+                state[key] = default_state[key]
 
-def calculate_reward(state, score, last_score):
-    # 当游戏撞车时返回较大的负奖励
-    if state['crashed']:
-        return -10
-    reward = 0
-    if state['obstacles']:
-        obstacle = state['obstacles'][0]
-        distance = obstacle['x']
-        if state['jumping']:
-            if 100 < distance < 200:
-                reward += 2
-            elif distance > 300:
-                reward -= 1
-            elif distance < 50:
-                reward -= 2
-        elif 50 < distance < 100:
-            reward -= 1
-    reward += 0.1
-    reward += (score - last_score) * 0.3
-    return reward
+        return state
+
+    except Exception as e:
+        print(f"获取游戏状态错误: {e}")
+        return {
+            'crashed': False,
+            'playing': False,
+            'speed': 0,
+            'score': [0],
+            'jumping': False,
+            'obstacles': []
+        }
 
 
 def save_training_data(ai):
@@ -249,8 +350,8 @@ def save_training_data(ai):
     plt.figure(figsize=(12, 6))
     plt.plot(scores, alpha=0.3, label='Score')
     plt.plot(moving_avg, label=f'{window_size}Moving Avg')
-    plt.title('Progress')
-    plt.xlabel('Rounds')
+    plt.title('Training Progress')
+    plt.xlabel('Episodes')
     plt.ylabel('Scores')
     plt.legend()
     plt.grid(True)
@@ -264,7 +365,8 @@ def main():
     episode = len(ai.scores)
     total_training_time = 0
     start_time = time.time()
-    target_update_interval = 10  # 每10回合更新一次目标网络
+    target_update_interval = 5  # 更频繁地更新目标网络
+
     try:
         while True:
             episode += 1
@@ -283,7 +385,16 @@ def main():
             while True:
                 try:
                     state = get_game_state(driver)
+                    if not state:
+                        print("无法获取游戏状态，重新开始...")
+                        break
+
                     current_state = ai.get_state(state)
+                    # 只在游戏正在进行时才检查状态是否有效
+                    if state.get('playing', False) and np.all(current_state == 0):
+                        print("等待有效游戏状态...")
+                        time.sleep(0.1)
+                        continue
                     current_score = int(''.join(map(str, state['score'])))
 
                     if state['crashed']:
@@ -300,6 +411,13 @@ def main():
                         if last_state is not None:
                             reward = calculate_reward(state, current_score, last_score)
                             ai.remember(last_state, last_action, reward, current_state, True)
+
+                        # 每回合结束后的额外训练
+                        if len(ai.memory) > 1000:
+                            print("执行额外训练...")
+                            for _ in range(200):
+                                ai.train(batch_size=128)
+
                         ai.save_progress()
                         if episode % 10 == 0:
                             save_training_data(ai)
@@ -317,24 +435,29 @@ def main():
                     last_action = should_jump
                     last_score = current_score
 
-                    # 每步多次训练以加快学习
-                    for _ in range(5):
-                        ai.train(batch_size=64)
+                    # 增加训练频率
+                    for _ in range(8):
+                        ai.train(batch_size=128)
 
                     time.sleep(0.01)
                 except Exception as e:
                     print(f"回合中发生错误: {e}")
                     break
-            driver.quit()
-            # 更新探索率，并周期性保证一定的探索
-            ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
-            if episode % 500 == 0:
-                ai.epsilon = max(ai.epsilon, 0.1)
 
-            # 每隔固定回合更新目标网络
+            driver.quit()
+
+            # 更新探索率
+            ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
+
+            # 定期提升探索率以防止局部最优
+            if episode % 100 == 0:
+                ai.epsilon = max(0.2, ai.epsilon)
+
+            # 更新目标网络
             if episode % target_update_interval == 0:
                 ai.update_target_model()
-                print("目标网络已更新。")
+                print("目标网络已更新")
+
     except KeyboardInterrupt:
         print("\n程序被用户中断")
         print("保存进度...")
