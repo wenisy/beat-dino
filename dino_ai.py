@@ -27,8 +27,8 @@ class DinoAI:
         self.learning_rate = 0.001
         self.gamma = 0.95
         self.epsilon = 1.0  # 初始探索率设为1.0，全面探索
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995  # 每回合后乘以0.995，使探索率更快下降
+        self.epsilon_min = 0.05  # 提高最低探索率，确保后期仍有一定随机性
+        self.epsilon_decay = 0.995  # 每回合后乘以0.995，使探索率逐渐下降
         self.scores = []
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
         # 使用 .keras 扩展名保存模型
@@ -146,7 +146,7 @@ class DinoAI:
             if not done:
                 target += self.gamma * np.amax(next_q[i])
             target_f = current_q[i]
-            # action 为布尔值：True 表示跳跃，对应索引1，False 表示不跳，对应索引0
+            # action 为布尔值：True 表示跳跃，对应索引1；False 表示不跳，对应索引0
             target_f[1 if action else 0] = target
             X.append(state)
             y.append(target_f)
@@ -159,7 +159,7 @@ def init_game():
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=800,600")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--headless")  # 如果需要，可启用无头模式：
+    options.add_argument("--headless")  # 启用无头模式
     driver = webdriver.Chrome(options=options)
     print("正在启动 Chrome...")
     driver.get("https://trex-runner.com/")
@@ -265,11 +265,13 @@ def main():
             last_score = 0
             last_state = None
             last_action = None
+
             while True:
                 try:
                     state = get_game_state(driver)
                     current_state = ai.get_state(state)
                     current_score = int(''.join(map(str, state['score'])))
+
                     if state['crashed']:
                         ai.scores.append(current_score)
                         episode_time = time.time() - episode_start
@@ -280,6 +282,7 @@ def main():
                         print(f"回合结束 - 得分：{current_score} | 最佳：{best_score}")
                         print(f"回合用时：{episode_time:.1f}秒 | 总训练时间：{total_training_time / 3600:.1f}小时")
                         print(f"探索率(epsilon)：{ai.epsilon:.3f} | 记忆池大小：{len(ai.memory)}")
+
                         if last_state is not None:
                             reward = calculate_reward(state, current_score, last_score)
                             ai.remember(last_state, last_action, reward, current_state, True)
@@ -287,25 +290,33 @@ def main():
                         if episode % 10 == 0:
                             save_training_data(ai)
                         break
+
                     should_jump = ai.act(current_state)
                     if should_jump:
                         actions.send_keys(Keys.SPACE).perform()
+
                     if last_state is not None:
                         reward = calculate_reward(state, current_score, last_score)
                         ai.remember(last_state, last_action, reward, current_state, False)
+
                     last_state = current_state
                     last_action = should_jump
                     last_score = current_score
+
                     # 每步多次训练以加快学习
                     for _ in range(5):
                         ai.train(batch_size=64)
+
                     time.sleep(0.01)
                 except Exception as e:
                     print(f"回合中发生错误: {e}")
                     break
             driver.quit()
-            # 每回合后更新探索率
+            # 每回合后更新探索率，并周期性重置一定的探索率（例如每500回合至少保持0.1）
             ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
+            if episode % 500 == 0:
+                ai.epsilon = max(ai.epsilon, 0.1)
+
             # 每隔固定回合更新目标网络
             if episode % target_update_interval == 0:
                 ai.update_target_model()
