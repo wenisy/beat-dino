@@ -92,37 +92,33 @@ class DinoAI:
             if not game_state or not isinstance(game_state, dict):
                 return np.zeros(9)
 
-            # 获取障碍物信息
+            # 获取障碍物信息，即使没有障碍物也返回默认值
             obstacles = game_state.get('obstacles', [])
-            if not obstacles:
-                return np.zeros(9)
+            if obstacles:
+                obstacle = obstacles[0]
+                next_obstacle = obstacles[1] if len(obstacles) > 1 else {}
+            else:
+                # 默认障碍物设在右侧边界，宽高给个较小默认值
+                obstacle = {}
+                next_obstacle = {}
 
-            # 安全地获取第一个障碍物
-            obstacle = obstacles[0]
-            if not isinstance(obstacle, dict):
-                return np.zeros(9)
-
-            # 安全地获取第二个障碍物
-            next_obstacle = obstacles[1] if len(obstacles) > 1 else None
-
-            # 安全地获取所有必要的值，使用默认值
             try:
-                obs_x = float(obstacle.get('x', 0))
+                obs_x = float(obstacle.get('x', 600))
             except (ValueError, TypeError):
-                obs_x = 0.0
+                obs_x = 600.0
 
             try:
-                obs_width = float(obstacle.get('width', 0))
+                obs_width = float(obstacle.get('width', 20))
             except (ValueError, TypeError):
-                obs_width = 0.0
+                obs_width = 20.0
 
             try:
-                obs_height = float(obstacle.get('height', 0))
+                obs_height = float(obstacle.get('height', 20))
             except (ValueError, TypeError):
-                obs_height = 0.0
+                obs_height = 20.0
 
             try:
-                next_x = float(next_obstacle.get('x', 600)) if next_obstacle else 600.0
+                next_x = float(next_obstacle.get('x', 600))
             except (ValueError, TypeError):
                 next_x = 600.0
 
@@ -199,13 +195,19 @@ class DinoAI:
 
 
 def calculate_reward(state, score, last_score):
+    # 如果撞到了，给予较大的惩罚
     if state['crashed']:
         return -20
 
     reward = 0
+
+    # 增加存活奖励
+    reward += 0.1
+
+    # 如果存在障碍物，根据距离和是否跳跃给予奖励或惩罚
     if state['obstacles']:
         obstacle = state['obstacles'][0]
-        distance = obstacle['x']
+        distance = obstacle.get('x', 600)
 
         if state['jumping']:
             if 80 < distance < 160:
@@ -219,9 +221,12 @@ def calculate_reward(state, score, last_score):
                 reward -= 2
             elif 80 < distance < 160:
                 reward += 0.5
+    else:
+        # 如果没有障碍物，鼓励保持原位而非无谓跳跃
+        if state.get('jumping', False):
+            reward -= 0.5
 
-    reward += 0.1
-
+    # 根据分数变化给予奖励
     score_diff = score - last_score
     if score_diff > 0:
         reward += score_diff * 0.5
@@ -245,7 +250,7 @@ def init_game():
     time.sleep(5)  # 增加等待时间
     try:
         print("正在查找游戏元素...")
-        canvas = WebDriverWait(driver, 10).until(  # 增加等待时间
+        canvas = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".runner-container .runner-canvas"))
         )
         print("正在开始游戏...")
@@ -323,7 +328,6 @@ def get_game_state(driver):
             'obstacles': []
         }
 
-        # 合并返回的状态和默认状态
         for key in default_state:
             if key not in state or state[key] is None:
                 state[key] = default_state[key]
@@ -349,7 +353,7 @@ def save_training_data(ai):
     moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid')
     plt.figure(figsize=(12, 6))
     plt.plot(scores, alpha=0.3, label='Score')
-    plt.plot(moving_avg, label=f'{window_size}Moving Avg')
+    plt.plot(moving_avg, label=f'{window_size} Moving Avg')
     plt.title('Training Progress')
     plt.xlabel('Episodes')
     plt.ylabel('Scores')
@@ -390,7 +394,7 @@ def main():
                         break
 
                     current_state = ai.get_state(state)
-                    # 只在游戏正在进行时才检查状态是否有效
+                    # 只有在游戏正在进行时才检查状态是否有效
                     if state.get('playing', False) and np.all(current_state == 0):
                         print("等待有效游戏状态...")
                         time.sleep(0.1)
@@ -406,7 +410,6 @@ def main():
                             print(f"新记录！得分：{current_score}")
                         print(f"回合结束 - 得分：{current_score} | 最佳：{best_score}")
                         print(f"回合用时：{episode_time:.1f}秒 | 总训练时间：{total_training_time / 3600:.1f}小时")
-                        print(f"探索率(epsilon)：{ai.epsilon:.3f} | 记忆池大小：{len(ai.memory)}")
 
                         if last_state is not None:
                             reward = calculate_reward(state, current_score, last_score)
@@ -446,12 +449,8 @@ def main():
 
             driver.quit()
 
-            # 更新探索率
+            # 更新探索率，让其持续衰减到设定的最小值
             ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
-
-            # 定期提升探索率以防止局部最优
-            if episode % 100 == 0:
-                ai.epsilon = max(0.2, ai.epsilon)
 
             # 更新目标网络
             if episode % target_update_interval == 0:
