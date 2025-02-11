@@ -60,7 +60,7 @@ class PrioritizedReplayBuffer:
 
 
 # -----------------------
-# Dino 游戏环境封装（复用同一浏览器）
+# Dino 游戏环境封装（利用 Selenium 复用同一浏览器）
 # -----------------------
 class DinoEnv:
     def __init__(self, headless=True):
@@ -95,7 +95,7 @@ class DinoEnv:
             self.driver.quit()
 
     def reset(self):
-        """通过 JavaScript 重启游戏，不用关闭浏览器"""
+        """通过 JS 重启游戏（不关闭浏览器）"""
         try:
             self.driver.execute_script("Runner.instance_.restart();")
             time.sleep(1)
@@ -103,6 +103,11 @@ class DinoEnv:
             print(f"游戏重启失败: {e}")
 
     def step(self, action):
+        """
+        模拟一步操作：
+          action == True 表示跳跃（发送空格键），否则不操作
+        返回：state, reward, done, info
+        """
         actions = ActionChains(self.driver)
         if action:
             actions.send_keys(Keys.SPACE).perform()
@@ -173,7 +178,7 @@ class DinoEnv:
 
 
 # -----------------------
-# 奖励函数（可根据需要进一步调试奖励缩放）
+# 奖励函数（根据游戏状态和得分返回奖励）
 # -----------------------
 def calculate_reward(state, score, optimal_score_diff=1):
     reward = 0
@@ -205,7 +210,7 @@ def calculate_reward(state, score, optimal_score_diff=1):
 
 
 # -----------------------
-# Dino AI 代理（使用 Double DQN 并加入 Huber Loss 与梯度裁剪）
+# Dino AI 代理（使用 Double DQN、Huber Loss、梯度裁剪，同时增加 ε 重启策略）
 # -----------------------
 class DinoAgent:
     def __init__(self, state_size=9, action_size=2):
@@ -217,7 +222,7 @@ class DinoAgent:
         self.gamma = 0.95
         self.epsilon = 1.0  # 初始探索率
         self.epsilon_min = 0.05  # 最小探索率
-        self.epsilon_decay = 0.995  # 衰减因子
+        self.epsilon_decay = 0.995  # 每步衰减（较缓慢）
         self.batch_size = 64
         self.update_target_freq = 1000  # 以步数更新目标网络
 
@@ -228,9 +233,9 @@ class DinoAgent:
         self.target_model = clone_model(self.model)
         self.target_model.set_weights(self.model.get_weights())
 
-        self.scores = []
-        self.avg_rewards = []
-        self.losses = []
+        self.scores = []  # 每回合得分记录
+        self.avg_rewards = []  # 每回合平均奖励记录
+        self.losses = []  # 每回合训练损失记录
         self.last_speed = 0
 
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
@@ -250,7 +255,7 @@ class DinoAgent:
             Dense(64, activation='relu'),
             Dense(self.action_size, activation='linear')
         ])
-        # 使用 Huber Loss 与梯度裁剪（clipnorm）
+        # 使用 Huber Loss 与梯度裁剪，降低梯度爆炸风险
         optimizer = Adam(learning_rate=self.learning_rate, clipnorm=1.0)
         model.compile(
             loss=tf.keras.losses.Huber(),
@@ -340,6 +345,7 @@ class DinoAgent:
             return np.zeros(self.state_size)
 
     def act(self, state_vector):
+        # 当随机数小于 ε 时，随机选择动作
         if np.random.rand() <= self.epsilon:
             return np.random.choice([True, False])
         q_values = self.model.predict(state_vector.reshape(1, -1), verbose=0)[0]
@@ -394,6 +400,7 @@ class DinoAgent:
         if self.train_step % self.update_target_freq == 0:
             self.update_target_model()
 
+        # 每步衰减 ε
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
@@ -434,13 +441,17 @@ def save_training_data(agent):
 
 
 # -----------------------
-# 主训练流程
+# 主训练流程，包含 ε 重启策略
 # -----------------------
 def main():
     env = DinoEnv(headless=True)
     agent = DinoAgent()
     episodes = 10000
     max_steps_per_episode = 1000
+
+    # 用于监控最近 N 回合平均得分，用来判断是否需要重启 ε
+    monitor_window = 20
+    best_recent_avg = -float('inf')
 
     try:
         for episode in range(len(agent.scores) + 1, episodes + 1):
@@ -478,6 +489,18 @@ def main():
             print(
                 f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
 
+            # 每 monitor_window 回合后检查最近得分的平均值，若明显下降，则重启 ε（提升探索）
+            if episode % monitor_window == 0:
+                recent_avg = np.mean(agent.scores[-monitor_window:])
+                print(f"最近 {monitor_window} 回合平均得分: {recent_avg:.2f}")
+                if recent_avg < best_recent_avg * 0.9 and best_recent_avg != -float('inf'):
+                    # 若下降超过 10%，临时将 ε 提高，帮助跳出局部最优
+                    agent.epsilon = max(0.2, agent.epsilon * 2)
+                    print("检测到性能下降，临时提升探索率!")
+                else:
+                    best_recent_avg = max(best_recent_avg, recent_avg)
+
+            # 定期保存模型与训练数据
             if episode % 10 == 0:
                 agent.save_progress()
                 save_training_data(agent)
