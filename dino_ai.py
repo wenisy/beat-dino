@@ -178,34 +178,45 @@ class DinoEnv:
 
 
 # -----------------------
-# 奖励函数（根据游戏状态和得分返回奖励）
+# 奖励函数（改进版）
 # -----------------------
 def calculate_reward(state, score, optimal_score_diff=1):
-    reward = 0
-    if state.get('crashed', False):
+    """
+    修改说明：
+      - 基础生存奖励设为较小正值
+      - 当检测到障碍物且距离小于150时：
+           如果正在跳跃，给予较大正奖励；
+           如果没有跳跃，给予较大负奖励；
+      - 其它情况下给予轻微奖励
+    """
+    # 如果撞车则给予重惩
+    if state.get('crashed', True):
         return -100
 
-    reward += 0.5  # 生存奖励
+    # 基础生存奖励
+    reward = 0.1
+    # 速度奖励（比例较小）
     speed = state.get('speed', 0)
-    reward += speed * 0.1
+    reward += speed * 0.05
 
+    # 检测障碍物
     if state.get('obstacles'):
         obstacle = state['obstacles'][0]
         distance = float(obstacle.get('x', 600))
-        optimal_jump_distance = 100 + speed * 3
-        if state.get('jumping', False):
-            if abs(distance - optimal_jump_distance) < 30:
-                reward += 10
-            elif distance < 50:
-                reward -= 5
-            elif distance > 200:
-                reward -= 2
+        # 如果障碍物很近（例如小于150像素），给予显著奖励/惩罚
+        if distance < 150:
+            if state.get('jumping', False):
+                reward += 20   # 正确跳跃，奖励大幅提升
+            else:
+                reward -= 20   # 错误未跳跃，惩罚较大
         else:
-            if distance < 50:
-                reward -= 10
-            elif distance > optimal_jump_distance + 50:
-                reward += 1
-    reward += optimal_score_diff * 2
+            reward += 0.5  # 障碍物较远时轻微奖励
+    else:
+        reward += 1.0  # 无障碍物时稍微奖励
+
+    # 得分差分奖励（这里幅度较小，可根据需要调整）
+    reward += optimal_score_diff * 0.1
+
     return reward
 
 
@@ -220,9 +231,9 @@ class DinoAgent:
         # 超参数
         self.learning_rate = 0.001
         self.gamma = 0.95
-        self.epsilon = 1.0  # 初始探索率
-        self.epsilon_min = 0.05  # 最小探索率
-        self.epsilon_decay = 0.995  # 每步衰减（较缓慢）
+        self.epsilon = 1.0          # 初始探索率
+        self.epsilon_min = 0.05     # 最小探索率
+        self.epsilon_decay = 0.995  # 每步衰减
         self.batch_size = 64
         self.update_target_freq = 1000  # 以步数更新目标网络
 
@@ -233,9 +244,9 @@ class DinoAgent:
         self.target_model = clone_model(self.model)
         self.target_model.set_weights(self.model.get_weights())
 
-        self.scores = []  # 每回合得分记录
-        self.avg_rewards = []  # 每回合平均奖励记录
-        self.losses = []  # 每回合训练损失记录
+        self.scores = []      # 每回合得分记录
+        self.avg_rewards = [] # 每回合平均奖励记录
+        self.losses = []      # 每回合训练损失记录
         self.last_speed = 0
 
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
@@ -255,7 +266,7 @@ class DinoAgent:
             Dense(64, activation='relu'),
             Dense(self.action_size, activation='linear')
         ])
-        # 使用 Huber Loss 与梯度裁剪，降低梯度爆炸风险
+        # 使用 Huber Loss 与梯度裁剪（clipnorm=1.0）
         optimizer = Adam(learning_rate=self.learning_rate, clipnorm=1.0)
         model.compile(
             loss=tf.keras.losses.Huber(),
@@ -416,8 +427,7 @@ def save_training_data(agent):
 
     plt.figure(figsize=(15, 5))
     window_size = 10
-    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid') if len(
-        scores) >= window_size else scores
+    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid') if len(scores) >= window_size else scores
 
     plt.subplot(131)
     plt.plot(scores, alpha=0.3, label='Score')
@@ -486,14 +496,13 @@ def main():
             avg_loss = np.mean(episode_losses) if episode_losses else 0
             agent.losses.append(avg_loss)
 
-            print(
-                f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
+            print(f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
 
             # 每 monitor_window 回合后检查最近得分的平均值，若明显下降，则重启 ε（提升探索）
             if episode % monitor_window == 0:
                 recent_avg = np.mean(agent.scores[-monitor_window:])
                 print(f"最近 {monitor_window} 回合平均得分: {recent_avg:.2f}")
-                if recent_avg < best_recent_avg * 0.9 and best_recent_avg != -float('inf'):
+                if best_recent_avg != -float('inf') and recent_avg < best_recent_avg * 0.9:
                     # 若下降超过 10%，临时将 ε 提高，帮助跳出局部最优
                     agent.epsilon = max(0.2, agent.epsilon * 2)
                     print("检测到性能下降，临时提升探索率!")
