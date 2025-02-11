@@ -62,12 +62,14 @@ class PrioritizedReplayBuffer:
 
 class DinoAI:
     def __init__(self):
-        self.memory = PrioritizedReplayBuffer(maxlen=50000)
-        self.learning_rate = 0.0005
-        self.gamma = 0.99
+        self.memory = PrioritizedReplayBuffer(maxlen=100000)  # 增加记忆容量
+        self.learning_rate = 0.001  # 提高初始学习率
+        self.gamma = 0.95  # 降低折扣因子，更注重即时奖励
         self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9975
+        self.epsilon_min = 0.05  # 提高最小探索率
+        self.epsilon_decay = 0.998  # 降低衰减速率
+        self.batch_size = 64  # 减小batch size
+        self.update_target_freq = 10  # 更频繁地更新目标网络
         self.scores = []
         self.avg_rewards = []
         self.losses = []
@@ -83,18 +85,17 @@ class DinoAI:
     def _build_model(self):
         model = Sequential([
             Input(shape=(9,)),
-            Dense(256, activation='relu'),
+            Dense(128, activation='relu'),
             BatchNormalization(),
-            Dense(512, activation='relu'),
-            BatchNormalization(),
-            Dropout(0.2),
             Dense(256, activation='relu'),
             BatchNormalization(),
             Dense(128, activation='relu'),
+            BatchNormalization(),
+            Dense(64, activation='relu'),
             Dense(2, activation='linear')
         ])
         model.compile(
-            loss=tf.keras.losses.Huber(),
+            loss='mse',  # 使用MSE损失函数
             optimizer=Adam(learning_rate=self.learning_rate),
             metrics=['mae']
         )
@@ -195,13 +196,13 @@ class DinoAI:
     def remember(self, state, action, reward, next_state, done):
         self.memory.add((state, action, reward, next_state, done))
 
-    def train(self, batch_size=128):
-        if len(self.memory.memory) < batch_size:
+    def train(self, batch_size=64):
+        if len(self.memory) < batch_size:
             return 0
 
         try:
             minibatch, indices = self.memory.sample(batch_size)
-            if not minibatch:  # 如果采样为空，直接返回
+            if not minibatch:
                 return 0
 
             states = np.array([x[0] for x in minibatch])
@@ -227,13 +228,16 @@ class DinoAI:
                 X.append(state)
                 y.append(target_f)
 
-            if X and y:  # 确保有数据才进行训练
-                history = self.model.fit(np.array(X), np.array(y), epochs=1, batch_size=32, verbose=0)
+            if X and y:
+                history = self.model.fit(
+                    np.array(X),
+                    np.array(y),
+                    epochs=1,
+                    batch_size=32,
+                    verbose=0
+                )
                 loss = history.history['loss'][0]
-
-                # 更新优先级
                 self.memory.update_priorities(indices, new_priorities)
-
                 return loss
             return 0
 
@@ -252,30 +256,42 @@ def calculate_reward(state, score, last_score):
     reward = 0
 
     if state['crashed']:
-        return -50
+        return -100  # 增加失败惩罚
 
-    reward += 0.1  # 生存奖励
+    # 基础生存奖励
+    reward += 0.5
 
+    # 速度奖励
+    speed = state.get('speed', 0)
+    reward += speed * 0.1
+
+    # 跳跃奖励
     if state['obstacles']:
         obstacle = state['obstacles'][0]
         distance = obstacle.get('x', 600)
-        speed = state.get('speed', 0)
 
-        optimal_jump_distance = 120 + speed * 2
+        # 根据速度调整最佳跳跃距离
+        optimal_jump_distance = 100 + speed * 3
 
         if state['jumping']:
-            if abs(distance - optimal_jump_distance) < 20:
-                reward += 5
-            elif distance < 60:
-                reward -= 3
-            elif distance > 200:
-                reward -= 1
+            # 在最佳距离范围内跳跃给予更高奖励
+            if abs(distance - optimal_jump_distance) < 30:
+                reward += 10
+            elif distance < 50:  # 太近跳跃
+                reward -= 5
+            elif distance > 200:  # 太远跳跃
+                reward -= 2
+        else:
+            # 不跳跃时的奖励/惩罚
+            if distance < 50:  # 应该跳但没跳
+                reward -= 10
+            elif distance > optimal_jump_distance + 50:  # 正确的不跳
+                reward += 1
 
-    reward += state.get('speed', 0) * 0.05
-
+    # 得分奖励
     score_diff = score - last_score
     if score_diff > 0:
-        reward += score_diff
+        reward += score_diff * 2
 
     return reward
 
@@ -413,10 +429,12 @@ def main():
     episode = len(ai.scores)
     total_training_time = 0
     start_time = time.time()
-    target_update_interval = 5
-    early_stopping_patience = 10
-    best_avg_score = 0
-    no_improvement_count = 0
+
+    # 早期停止参数
+    patience = 15
+    min_delta = 5
+    best_avg_score = float('-inf')
+    no_improvement_counter = 0
 
     try:
         while True:
@@ -436,76 +454,54 @@ def main():
             episode_rewards = []
             episode_losses = []
 
+            # 每回合的训练循环
             while True:
                 try:
                     state = get_game_state(driver)
                     if not state:
-                        print("无法获取游戏状态，重新开始...")
                         break
 
                     current_state = ai.get_state(state)
-                    if state.get('playing', False) and np.all(current_state == 0):
-                        print("等待有效游戏状态...")
-                        time.sleep(0.1)
-                        continue
-
                     current_score = int(''.join(map(str, state['score'])))
 
+                    # 游戏结束处理
                     if state['crashed']:
-                        ai.scores.append(current_score)
-                        episode_time = time.time() - episode_start
-                        total_training_time = time.time() - start_time
-
-                        # 计算平均指标
-                        avg_reward = np.mean(episode_rewards) if episode_rewards else 0
-                        avg_loss = np.mean(episode_losses) if episode_losses else 0
-                        ai.avg_rewards.append(avg_reward)
-                        ai.losses.append(avg_loss)
-
-                        if current_score > best_score:
-                            best_score = current_score
-                            print(f"新记录！得分：{current_score}")
-
-                        print(f"回合结束 - 得分：{current_score} | 最佳：{best_score}")
-                        print(f"平均奖励：{avg_reward:.2f} | 平均损失：{avg_loss:.4f}")
-                        print(f"回合用时：{episode_time:.1f}秒 | 总训练时间：{total_training_time / 3600:.1f}小时")
-                        print(f"当前探索率：{ai.epsilon:.4f}")
-
                         if last_state is not None:
                             reward = calculate_reward(state, current_score, last_score)
                             ai.remember(last_state, last_action, reward, current_state, True)
                             episode_rewards.append(reward)
 
-                        # 早期停止检查
-                        current_avg_score = np.mean(ai.scores[-10:]) if len(ai.scores) >= 10 else 0
-                        if current_avg_score > best_avg_score:
-                            best_avg_score = current_avg_score
-                            no_improvement_count = 0
-                        else:
-                            no_improvement_count += 1
+                        # 更新统计信息
+                        ai.scores.append(current_score)
+                        avg_reward = np.mean(episode_rewards) if episode_rewards else 0
+                        avg_loss = np.mean(episode_losses) if episode_losses else 0
+                        ai.avg_rewards.append(avg_reward)
+                        ai.losses.append(avg_loss)
 
-                        if no_improvement_count >= early_stopping_patience:
-                            print(f"训练停止：{early_stopping_patience} 回合内没有改善")
-                            ai.save_progress()
-                            save_training_data(ai)
+                        # 打印回合信息
+                        print(f"回合 {episode} - 得分: {current_score} | 最佳: {best_score}")
+                        print(f"平均奖励: {avg_reward:.2f} | 损失: {avg_loss:.4f}")
+
+                        # 检查是否需要早期停止
+                        current_avg = np.mean(ai.scores[-10:]) if len(ai.scores) >= 10 else current_score
+                        if current_avg > best_avg_score + min_delta:
+                            best_avg_score = current_avg
+                            no_improvement_counter = 0
+                        else:
+                            no_improvement_counter += 1
+
+                        if no_improvement_counter >= patience:
+                            print("触发早期停止")
                             return
 
-                        # 额外训练和保存
-                        if len(ai.memory.memory) > 1000:
-                            print("执行额外训练...")
-                            for _ in range(200):
-                                loss = ai.train(batch_size=128)
-                                episode_losses.append(loss)
-
-                        ai.save_progress()
-                        if episode % 10 == 0:
-                            save_training_data(ai)
                         break
 
+                    # 选择动作
                     should_jump = ai.act(current_state)
                     if should_jump:
                         actions.send_keys(Keys.SPACE).perform()
 
+                    # 存储经验
                     if last_state is not None:
                         reward = calculate_reward(state, current_score, last_score)
                         ai.remember(last_state, last_action, reward, current_state, False)
@@ -516,15 +512,18 @@ def main():
                     last_score = current_score
 
                     # 训练
-                    for _ in range(4):
-                        loss = ai.train(batch_size=128)
-                        if loss:
-                            episode_losses.append(loss)
+                    loss = ai.train(ai.batch_size)
+                    if loss:
+                        episode_losses.append(loss)
+
+                    # 更新目标网络
+                    if episode % ai.update_target_freq == 0:
+                        ai.update_target_model()
 
                     time.sleep(0.01)
 
                 except Exception as e:
-                    print(f"回合中发生错误: {e}")
+                    print(f"回合执行错误: {e}")
                     break
 
             driver.quit()
@@ -532,28 +531,15 @@ def main():
             # 更新探索率
             ai.epsilon = max(ai.epsilon_min, ai.epsilon * ai.epsilon_decay)
 
-            # 更新学习率
-            ai.update_learning_rate(episode)
-
-            # 更新目标网络
-            if episode % target_update_interval == 0:
-                ai.update_target_model()
-                print("目标网络已更新")
+            # 定期保存
+            if episode % 5 == 0:
+                ai.save_progress()
+                save_training_data(ai)
 
     except KeyboardInterrupt:
-        print("\n程序被用户中断")
-        print("保存进度...")
+        print("\n训练被中断")
         ai.save_progress()
         save_training_data(ai)
-        total_training_time = time.time() - start_time
-        print("进度已保存")
-        hours = total_training_time / 3600
-        print(f"\n训练总结:")
-        print(f"总训练时间: {hours:.1f}小时")
-        print(f"训练回合数: {episode}")
-        print(f"最高得分: {best_score}")
-        print(f"平均得分: {np.mean(ai.scores):.1f}")
-        print(f"最终探索率: {ai.epsilon:.3f}")
 
 
 if __name__ == "__main__":
