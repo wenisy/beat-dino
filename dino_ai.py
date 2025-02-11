@@ -16,7 +16,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential, clone_model, load_model
-from tensorflow.keras.layers import Dense, Input, BatchNormalization
+from tensorflow.keras.layers import Dense, Input, BatchNormalization, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
 
@@ -190,7 +190,7 @@ def calculate_reward(state, score, optimal_score_diff=1):
       - 其它情况下给予轻微奖励
     """
     # 如果撞车则给予重惩
-    if state.get('crashed', True):
+    if state.get('crashed', False):
         return -100
 
     # 基础生存奖励
@@ -203,18 +203,18 @@ def calculate_reward(state, score, optimal_score_diff=1):
     if state.get('obstacles'):
         obstacle = state['obstacles'][0]
         distance = float(obstacle.get('x', 600))
-        # 如果障碍物很近（例如小于150像素），给予显著奖励/惩罚
+        # 当障碍物很近（例如小于150像素）时：
         if distance < 150:
             if state.get('jumping', False):
-                reward += 20   # 正确跳跃，奖励大幅提升
+                reward += 20  # 正确跳跃时奖励大
             else:
-                reward -= 20   # 错误未跳跃，惩罚较大
+                reward -= 20  # 错误未跳跃时惩罚大
         else:
             reward += 0.5  # 障碍物较远时轻微奖励
     else:
-        reward += 1.0  # 无障碍物时稍微奖励
+        reward += 1.0  # 无障碍物时给予奖励
 
-    # 得分差分奖励（这里幅度较小，可根据需要调整）
+    # 得分差分奖励（幅度较小）
     reward += optimal_score_diff * 0.1
 
     return reward
@@ -231,8 +231,8 @@ class DinoAgent:
         # 超参数
         self.learning_rate = 0.001
         self.gamma = 0.95
-        self.epsilon = 1.0          # 初始探索率
-        self.epsilon_min = 0.05     # 最小探索率
+        self.epsilon = 1.0  # 初始探索率
+        self.epsilon_min = 0.05  # 最小探索率
         self.epsilon_decay = 0.995  # 每步衰减
         self.batch_size = 64
         self.update_target_freq = 1000  # 以步数更新目标网络
@@ -244,9 +244,9 @@ class DinoAgent:
         self.target_model = clone_model(self.model)
         self.target_model.set_weights(self.model.get_weights())
 
-        self.scores = []      # 每回合得分记录
-        self.avg_rewards = [] # 每回合平均奖励记录
-        self.losses = []      # 每回合训练损失记录
+        self.scores = []  # 每回合得分记录
+        self.avg_rewards = []  # 每回合平均奖励记录
+        self.losses = []  # 每回合训练损失记录
         self.last_speed = 0
 
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
@@ -259,10 +259,13 @@ class DinoAgent:
             Input(shape=(self.state_size,)),
             Dense(128, activation='relu'),
             BatchNormalization(),
+            Dropout(0.2),
             Dense(256, activation='relu'),
             BatchNormalization(),
+            Dropout(0.2),
             Dense(128, activation='relu'),
             BatchNormalization(),
+            Dropout(0.2),
             Dense(64, activation='relu'),
             Dense(self.action_size, activation='linear')
         ])
@@ -427,7 +430,8 @@ def save_training_data(agent):
 
     plt.figure(figsize=(15, 5))
     window_size = 10
-    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid') if len(scores) >= window_size else scores
+    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid') if len(
+        scores) >= window_size else scores
 
     plt.subplot(131)
     plt.plot(scores, alpha=0.3, label='Score')
@@ -451,7 +455,7 @@ def save_training_data(agent):
 
 
 # -----------------------
-# 主训练流程，包含 ε 重启策略
+# 主训练流程，包含 ε 重启与动态调整学习率策略
 # -----------------------
 def main():
     env = DinoEnv(headless=True)
@@ -462,6 +466,7 @@ def main():
     # 用于监控最近 N 回合平均得分，用来判断是否需要重启 ε
     monitor_window = 20
     best_recent_avg = -float('inf')
+    prev_loss = None  # 用于记录上一个监控窗口的平均损失
 
     try:
         for episode in range(len(agent.scores) + 1, episodes + 1):
@@ -496,18 +501,29 @@ def main():
             avg_loss = np.mean(episode_losses) if episode_losses else 0
             agent.losses.append(avg_loss)
 
-            print(f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
+            print(
+                f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
 
-            # 每 monitor_window 回合后检查最近得分的平均值，若明显下降，则重启 ε（提升探索）
+            # 每 monitor_window 回合后检查最近得分的平均值和平均损失
             if episode % monitor_window == 0:
                 recent_avg = np.mean(agent.scores[-monitor_window:])
                 print(f"最近 {monitor_window} 回合平均得分: {recent_avg:.2f}")
                 if best_recent_avg != -float('inf') and recent_avg < best_recent_avg * 0.9:
-                    # 若下降超过 10%，临时将 ε 提高，帮助跳出局部最优
                     agent.epsilon = max(0.2, agent.epsilon * 2)
                     print("检测到性能下降，临时提升探索率!")
                 else:
                     best_recent_avg = max(best_recent_avg, recent_avg)
+
+                # 动态调整学习率
+                recent_loss = np.mean(agent.losses[-monitor_window:])
+                if prev_loss is not None and recent_loss > prev_loss * 1.1:
+                    # 如果最近平均损失比上一个窗口高出10%，降低学习率 10%
+                    new_lr = agent.learning_rate * 0.9
+                    agent.learning_rate = max(new_lr, 1e-5)
+                    # 直接使用 assign 方法更新优化器学习率
+                    agent.model.optimizer.learning_rate.assign(agent.learning_rate)
+                    print(f"降低学习率到: {agent.learning_rate:.6f}")
+                prev_loss = recent_loss
 
             # 定期保存模型与训练数据
             if episode % 10 == 0:
