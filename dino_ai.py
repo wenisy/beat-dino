@@ -181,35 +181,51 @@ class DinoEnv:
 # 奖励函数（改进版）
 # -----------------------
 def calculate_reward(state, score, prev_score=0):
-    reward = 0
+    """
+    改进版奖励函数：
+      1. 每步存活奖励 +0.1
+      2. 得分增加部分按比例奖励（例如 0.1 倍的增量）
+      3. 如果障碍物较近且代理正确跳跃则给予较高奖励，
+         否则根据距离给予惩罚
+      4. 撞车时给予严重惩罚
+    """
+    reward = 0.0
 
-    # 获取最近的障碍物
+    # 1. 生存奖励：鼓励持续前进
+    reward += 0.1
+
+    # 2. 得分奖励：基于得分增量给予奖励（需在外部传入上一时刻的分数）
+    delta_score = score - prev_score
+    reward += delta_score * 0.1  # 这里的比例系数可以根据实际情况调整
+
+    # 3. 根据障碍物情况奖励或惩罚
     obstacles = state.get('obstacles', [])
     if obstacles:
         obstacle = obstacles[0]
         distance = float(obstacle.get('x', 600))
-
-        # 智能体正在跳跃
         if state.get('jumping', False):
-            if distance < 150:  # 障碍物近且跳跃
-                reward += 10  # 正确的跳跃给予高奖励
-            else:  # 没有障碍物却跳跃
-                reward -= 5  # 惩罚无意义跳跃
-        else:  # 智能体没有跳跃
-            if distance < 100:  # 障碍物很近却不跳
-                reward -= 10  # 严重惩罚
+            if distance < 150:  # 障碍物近时跳跃正确
+                reward += 10
+            else:  # 没有障碍物却跳跃，惩罚
+                reward -= 5
+        else:
+            if distance < 100:  # 障碍物非常近时未跳跃
+                reward -= 10
+            elif distance < 150:  # 障碍物距离较近但还没到危险边界，可给予微小正奖励
+                reward += 2
 
-    # 撞车严重惩罚
+    # 4. 撞车惩罚
     if state.get('crashed', False):
         reward -= 100
 
     return reward
 
+
 # -----------------------
 # Dino AI 代理（使用 Double DQN、Huber Loss、梯度裁剪，同时增加 ε 重启策略）
 # -----------------------
 class DinoAgent:
-    def __init__(self, state_size=9, action_size=2):
+    def __init__(self, state_size=10, action_size=2):
         self.state_size = state_size
         self.action_size = action_size
 
@@ -316,32 +332,45 @@ class DinoAgent:
                 obstacle = {}
                 next_obstacle = {}
 
+            # 提取障碍物相关信息，并归一化处理
             obs_x = float(obstacle.get('x', 600))
             obs_width = float(obstacle.get('width', 20))
             obs_height = float(obstacle.get('height', 20))
             next_x = float(next_obstacle.get('x', 600))
             speed = float(game_state.get('speed', 1))
-            jumping = bool(game_state.get('jumping', False))
+            jumping = 1.0 if game_state.get('jumping', False) else 0.0
+
+            # 新增特征：障碍物类型标志
+            # 如果障碍物类型为 "pterodactyl" 或 "bird"，则置为 1；否则为 0
+            obs_type_str = str(obstacle.get('type', 'unknown')).lower()
+            obstacle_type = 1.0 if obs_type_str in ['pterodactyl', 'bird'] else 0.0
+
+            # 加速度特征：当前速度与上一时刻速度的变化率
             acceleration = (speed - self.last_speed) / 5.0
             self.last_speed = speed
 
+            # 构建状态向量，注意总共 10 个特征
             state_vector = np.array([
                 obs_x / 600.0,
                 obs_width / 60.0,
                 obs_height / 50.0,
                 next_x / 600.0,
                 speed / 13.0,
-                float(jumping),
+                jumping,
                 acceleration,
                 (obs_x / speed) if speed > 0 else 0.0,
-                1.0 if obs_height > 40 else 0.0
+                1.0 if obs_height > 40 else 0.0,
+                obstacle_type
             ], dtype=np.float32)
+
+            # 对状态向量进行数值清洗与裁剪
             state_vector = np.nan_to_num(state_vector, nan=0.0, posinf=1.0, neginf=-1.0)
             state_vector = np.clip(state_vector, -1.0, 1.0)
             return self.preprocess_state(state_vector)
         except Exception as e:
             print(f"状态转换错误: {e}")
-            return np.zeros(self.state_size)
+            # 注意，此处状态维度已改为 10
+            return np.zeros(10)
 
     def act(self, state_vector):
         # 当随机数小于 ε 时，随机选择动作
@@ -444,7 +473,7 @@ def save_training_data(agent):
 # -----------------------
 def main():
     env = DinoEnv(headless=True)
-    agent = DinoAgent()
+    agent = DinoAgent(state_size=10, action_size=2)
     episodes = 10000
     max_steps_per_episode = 1000
 
