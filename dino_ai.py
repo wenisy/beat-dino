@@ -39,13 +39,16 @@ class PrioritizedReplayBuffer:
         self.priorities.append(priority)
 
     def get_probabilities(self, beta):
+        if len(self.memory) == 0:
+            return [], []
+
         priorities = np.array(self.priorities)
         scaled_priorities = priorities ** self.alpha
-        probs = scaled_priorities / sum(scaled_priorities)
+        probs = scaled_priorities / np.sum(scaled_priorities)
 
         # 计算重要性权重
         weights = (len(self.memory) * probs) ** (-beta)
-        weights = weights / max(weights)
+        weights = weights / np.max(weights)  # 归一化权重
 
         return probs, weights
 
@@ -53,15 +56,19 @@ class PrioritizedReplayBuffer:
         if len(self.memory) == 0:
             return [], [], []
 
+        # 确保batch_size不超过内存大小
+        batch_size = min(batch_size, len(self.memory))
+
         probs, weights = self.get_probabilities(beta)
 
-        try:
-            indices = np.random.choice(len(self.memory), batch_size, p=probs, replace=False)
-        except ValueError:
-            indices = np.random.choice(len(self.memory), batch_size, replace=False)
+        # 采样索引
+        indices = np.random.choice(len(self.memory), batch_size, p=probs, replace=False)
 
-        samples = [self.memory[i] for i in indices]
-        return samples, indices, weights
+        # 获取对应的样本和权重
+        samples = [self.memory[idx] for idx in indices]
+        sample_weights = weights[indices]
+
+        return samples, indices, sample_weights
 
     def update_priorities(self, indices, priorities):
         for idx, priority in zip(indices, priorities):
@@ -242,13 +249,14 @@ class DinoAgent:
         self.per_beta = 0.4
         self.per_beta_increment = 0.001
 
+        # 创建优化器
+        self.optimizer_fast = Adam(learning_rate=self.learning_rate * 2)
+        self.optimizer_slow = Adam(learning_rate=self.learning_rate)
+
         # 神经网络与优化器
         self.model = self._build_model()
         self.target_model = self._build_model()
         self.target_model.set_weights(self.model.get_weights())
-
-        self.optimizer_fast = Adam(learning_rate=self.learning_rate * 2)
-        self.optimizer_slow = Adam(learning_rate=self.learning_rate)
 
         # 经验回放与训练记录
         self.memory = PrioritizedReplayBuffer(maxlen=100000, alpha=self.per_alpha)
@@ -384,6 +392,13 @@ class DinoAgent:
         # 使用优先级采样
         minibatch, indices, weights = self.memory.sample(self.batch_size, self.per_beta)
 
+        if not minibatch:  # 检查是否为空
+            return 0
+
+        # 确保所有数组的长度一致
+        batch_size = len(minibatch)
+        weights = np.array(weights, dtype=np.float32)
+
         states = np.array([exp[0] for exp in minibatch])
         actions = np.array([exp[1] for exp in minibatch])
         rewards = np.array([exp[2] for exp in minibatch])
@@ -398,16 +413,27 @@ class DinoAgent:
             # 下一状态的Q值
             next_q = self.target_model(next_states, training=False)
 
+            # 创建动作掩码 (one-hot)
+            action_mask = tf.one_hot(tf.cast(actions, tf.int32), self.action_size)
+
             # 计算目标Q值
-            for i in range(self.batch_size):
+            for i in range(batch_size):
                 if dones[i]:
+                    target_q[i] = current_q[i].numpy()
                     target_q[i][1 if actions[i] else 0] = rewards[i] * self.reward_scale
                 else:
+                    target_q[i] = current_q[i].numpy()
                     target_q[i][1 if actions[i] else 0] = (rewards[i] * self.reward_scale +
                                                            self.gamma * np.max(next_q[i]))
 
-            # 计算加权损失
-            losses = tf.square(target_q - current_q)
+            # 计算损失
+            losses = tf.reduce_sum(tf.square(target_q - current_q) * action_mask, axis=1)
+
+            # 确保weights形状正确
+            weights = tf.reshape(weights, [-1])  # 展平权重数组
+            losses = tf.reshape(losses, [-1])  # 展平损失数组
+
+            # 应用样本权重并计算平均损失
             weighted_losses = tf.reduce_mean(weights * losses)
 
         # 计算梯度
