@@ -15,21 +15,22 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 import tensorflow as tf
-from tensorflow.keras.models import Sequential, clone_model, load_model
-from tensorflow.keras.layers import Dense, Input, BatchNormalization, Dropout
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Dense, Input, BatchNormalization, Dropout, Add, Activation
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
 
-warnings.filterwarnings('ignore', category=Warning)
+warnings.filterwarnings('ignore')
 
 
 # -----------------------
-# 优先经验回放缓冲区
+# 改进的优先经验回放缓冲区
 # -----------------------
 class PrioritizedReplayBuffer:
-    def __init__(self, maxlen):
+    def __init__(self, maxlen, alpha=0.6):
         self.memory = deque(maxlen=maxlen)
         self.priorities = deque(maxlen=maxlen)
+        self.alpha = alpha
 
     def add(self, experience, priority=None):
         if priority is None:
@@ -37,18 +38,30 @@ class PrioritizedReplayBuffer:
         self.memory.append(experience)
         self.priorities.append(priority)
 
-    def sample(self, batch_size):
+    def get_probabilities(self, beta):
+        priorities = np.array(self.priorities)
+        scaled_priorities = priorities ** self.alpha
+        probs = scaled_priorities / sum(scaled_priorities)
+
+        # 计算重要性权重
+        weights = (len(self.memory) * probs) ** (-beta)
+        weights = weights / max(weights)
+
+        return probs, weights
+
+    def sample(self, batch_size, beta):
         if len(self.memory) == 0:
-            return [], []
-        total_priority = sum(self.priorities) + 1e-10
-        probs = np.array(self.priorities) / total_priority
-        batch_size = min(batch_size, len(self.memory))
+            return [], [], []
+
+        probs, weights = self.get_probabilities(beta)
+
         try:
             indices = np.random.choice(len(self.memory), batch_size, p=probs, replace=False)
         except ValueError:
             indices = np.random.choice(len(self.memory), batch_size, replace=False)
+
         samples = [self.memory[i] for i in indices]
-        return samples, indices
+        return samples, indices, weights
 
     def update_priorities(self, indices, priorities):
         for idx, priority in zip(indices, priorities):
@@ -60,7 +73,7 @@ class PrioritizedReplayBuffer:
 
 
 # -----------------------
-# Dino 游戏环境封装（利用 Selenium 复用同一浏览器）
+# Dino游戏环境（保持不变）
 # -----------------------
 class DinoEnv:
     def __init__(self, headless=True):
@@ -75,7 +88,7 @@ class DinoEnv:
         self._init_game()
 
     def _init_game(self):
-        print("正在启动 Chrome 并加载游戏...")
+        print("正在启动Chrome并加载游戏...")
         self.driver.get("https://trex-runner.com/")
         time.sleep(5)
         try:
@@ -83,7 +96,6 @@ class DinoEnv:
             self.canvas = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".runner-container .runner-canvas"))
             )
-            # 点击启动游戏
             self.canvas.click()
             time.sleep(2)
             actions = ActionChains(self.driver)
@@ -95,7 +107,6 @@ class DinoEnv:
             self.driver.quit()
 
     def reset(self):
-        """通过 JS 重启游戏（不关闭浏览器）"""
         try:
             self.driver.execute_script("Runner.instance_.restart();")
             time.sleep(1)
@@ -103,24 +114,53 @@ class DinoEnv:
             print(f"游戏重启失败: {e}")
 
     def step(self, action):
-        """
-        模拟一步操作：
-          action == True 表示跳跃（发送空格键），否则不操作
-        返回：state, reward, done, info
-        """
         actions = ActionChains(self.driver)
         if action:
             actions.send_keys(Keys.SPACE).perform()
-        time.sleep(0.01)  # 控制步长
+        time.sleep(0.01)
 
         state = self.get_game_state()
         done = state.get('crashed', False)
         score_str = ''.join(map(str, state.get('score', [0])))
         score = int(score_str) if score_str.isdigit() else 0
 
-        reward = calculate_reward(state, score)
+        reward = self.calculate_reward(state, score)
         info = {'score': score}
         return state, reward, done, info
+
+    def calculate_reward(self, state, score):
+        """改进的奖励计算"""
+        reward = 0.0
+
+        # 基础生存奖励
+        reward += 0.1
+
+        # 基于速度的奖励
+        speed = state.get('speed', 0)
+        reward += speed * 0.01
+
+        obstacles = state.get('obstacles', [])
+        if obstacles:
+            obstacle = obstacles[0]
+            distance = float(obstacle.get('x', 600))
+
+            # 根据距离给予奖励
+            if distance < 100:  # 非常近
+                if state.get('jumping', False):  # 正确的跳跃
+                    reward += 15
+                else:  # 危险的不跳
+                    reward -= 20
+            elif distance < 200:  # 中等距离
+                if state.get('jumping', False):  # 过早跳跃
+                    reward -= 5
+                else:
+                    reward += 5
+
+        # 撞车惩罚
+        if state.get('crashed', False):
+            reward -= 100
+
+        return reward
 
     def get_game_state(self):
         try:
@@ -178,143 +218,98 @@ class DinoEnv:
 
 
 # -----------------------
-# 奖励函数（改进版）
-# -----------------------
-def calculate_reward(state, score, prev_score=0):
-    """
-    改进版奖励函数：
-      1. 每步存活奖励 +0.1
-      2. 得分增加部分按比例奖励（例如 0.1 倍的增量）
-      3. 如果障碍物较近且代理正确跳跃则给予较高奖励，
-         否则根据距离给予惩罚
-      4. 撞车时给予严重惩罚
-    """
-    reward = 0.0
-
-    # 1. 生存奖励：鼓励持续前进
-    reward += 0.1
-
-    # 2. 得分奖励：基于得分增量给予奖励（需在外部传入上一时刻的分数）
-    delta_score = score - prev_score
-    reward += delta_score * 0.1  # 这里的比例系数可以根据实际情况调整
-
-    # 3. 根据障碍物情况奖励或惩罚
-    obstacles = state.get('obstacles', [])
-    if obstacles:
-        obstacle = obstacles[0]
-        distance = float(obstacle.get('x', 600))
-        if state.get('jumping', False):
-            if distance < 150:  # 障碍物近时跳跃正确
-                reward += 10
-            else:  # 没有障碍物却跳跃，惩罚
-                reward -= 5
-        else:
-            if distance < 100:  # 障碍物非常近时未跳跃
-                reward -= 10
-            elif distance < 150:  # 障碍物距离较近但还没到危险边界，可给予微小正奖励
-                reward += 2
-
-    # 4. 撞车惩罚
-    if state.get('crashed', False):
-        reward -= 100
-
-    return reward
-
-
-# -----------------------
-# Dino AI 代理（使用 Double DQN、Huber Loss、梯度裁剪，同时增加 ε 重启策略）
+# 改进的Dino AI代理
 # -----------------------
 class DinoAgent:
     def __init__(self, state_size=10, action_size=2):
         self.state_size = state_size
         self.action_size = action_size
 
-        # 超参数
-        self.learning_rate = 0.001
-        self.gamma = 0.95
-        self.epsilon = 1.0  # 初始探索率
-        self.epsilon_min = 0.05  # 最小探索率
-        self.epsilon_decay = 0.995  # 每步衰减
-        self.batch_size = 64
-        self.update_target_freq = 1000  # 以步数更新目标网络
+        # 核心超参数
+        self.gamma = 0.99  # 折扣因子
+        self.learning_rate = 0.0001  # 基础学习率
+        self.batch_size = 128  # 增大batch size
+        self.tau = 0.001  # 软更新系数
 
-        self.memory = PrioritizedReplayBuffer(maxlen=100000)
-        self.train_step = 0
+        # 探索相关参数
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.9995
+        self.exploration_noise = 0.1
 
+        # 优先经验回放参数
+        self.per_alpha = 0.6
+        self.per_beta = 0.4
+        self.per_beta_increment = 0.001
+
+        # 神经网络与优化器
         self.model = self._build_model()
-        self.target_model = clone_model(self.model)
+        self.target_model = self._build_model()
         self.target_model.set_weights(self.model.get_weights())
 
-        self.scores = []  # 每回合得分记录
-        self.avg_rewards = []  # 每回合平均奖励记录
-        self.losses = []  # 每回合训练损失记录
-        self.last_speed = 0
+        self.optimizer_fast = Adam(learning_rate=self.learning_rate * 2)
+        self.optimizer_slow = Adam(learning_rate=self.learning_rate)
 
+        # 经验回放与训练记录
+        self.memory = PrioritizedReplayBuffer(maxlen=100000, alpha=self.per_alpha)
+        self.train_step = 0
+
+        # 动态奖励缩放
+        self.reward_scale = 1.0
+        self.reward_history = deque(maxlen=1000)
+
+        # 性能指标记录
+        self.scores = []
+        self.avg_rewards = []
+        self.losses = []
+        self.q_values = []
+
+        # 模型保存路径
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
         self.model_path = os.path.join(self.save_dir, 'dino_model.keras')
         self.state_path = os.path.join(self.save_dir, 'dino_ai_state.pkl')
+
         self.load_progress()
 
     def _build_model(self):
-        model = Sequential([
-            Input(shape=(self.state_size,)),
-            Dense(128, activation='relu'),
-            BatchNormalization(),
-            Dropout(0.2),
-            Dense(256, activation='relu'),
-            BatchNormalization(),
-            Dropout(0.2),
-            Dense(128, activation='relu'),
-            BatchNormalization(),
-            Dropout(0.2),
-            Dense(64, activation='relu'),
-            Dense(self.action_size, activation='linear')
-        ])
-        # 使用 Huber Loss 与梯度裁剪（clipnorm=1.0）
-        optimizer = Adam(learning_rate=self.learning_rate, clipnorm=1.0)
-        model.compile(
-            loss=tf.keras.losses.Huber(),
-            optimizer=optimizer,
-            metrics=['mae']
-        )
+        inputs = Input(shape=(self.state_size,))
+
+        # 第一层特征提取
+        x = Dense(128, activation='relu')(inputs)
+        x = BatchNormalization()(x)
+        x = Dropout(0.1)(x)
+
+        # 残差块
+        for _ in range(3):
+            skip = x
+            x = Dense(128, activation='relu')(x)
+            x = BatchNormalization()(x)
+            x = Dense(128, activation='linear')(x)
+            x = BatchNormalization()(x)
+            x = Add()([x, skip])
+            x = Activation('relu')(x)
+            x = Dropout(0.1)(x)
+
+        # 输出层
+        x = Dense(64, activation='relu')(x)
+        outputs = Dense(self.action_size, activation='linear')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=self.optimizer_fast, loss='huber')
         return model
 
-    def update_target_model(self):
-        self.target_model.set_weights(self.model.get_weights())
+    def soft_update_target_model(self):
+        weights = self.model.get_weights()
+        target_weights = self.target_model.get_weights()
+        for i in range(len(weights)):
+            target_weights[i] = self.tau * weights[i] + (1 - self.tau) * target_weights[i]
+        self.target_model.set_weights(target_weights)
 
-    def save_progress(self):
-        tf.keras.models.save_model(self.model, self.model_path)
-        state = {
-            'memory': self.memory.memory,
-            'priorities': self.memory.priorities,
-            'epsilon': self.epsilon,
-            'scores': self.scores,
-            'avg_rewards': self.avg_rewards,
-            'losses': self.losses
-        }
-        with open(self.state_path, 'wb') as f:
-            pickle.dump(state, f)
-        print("模型及训练状态已保存。")
-
-    def load_progress(self):
-        if os.path.exists(self.model_path) and os.path.exists(self.state_path):
-            try:
-                self.model = load_model(self.model_path)
-                self.target_model = clone_model(self.model)
-                self.target_model.set_weights(self.model.get_weights())
-                with open(self.state_path, 'rb') as f:
-                    state = pickle.load(f)
-                self.memory.memory = state['memory']
-                self.memory.priorities = state['priorities']
-                self.epsilon = state['epsilon']
-                self.scores = state['scores']
-                self.avg_rewards = state.get('avg_rewards', [])
-                self.losses = state.get('losses', [])
-                print(f"加载进度成功: 已训练 {len(self.scores)} 回合")
-            except Exception as e:
-                print(f"加载进度出错: {e}，将重新开始训练")
-        else:
-            print("未找到保存的进度，将从头开始训练。")
+    def update_reward_scale(self, reward):
+        self.reward_history.append(abs(reward))
+        if len(self.reward_history) >= 100:
+            scale = 1.0 / (np.mean(self.reward_history) + 1e-6)
+            self.reward_scale = min(max(scale, 0.1), 10.0)
 
     def preprocess_state(self, state_vector):
         if np.all(state_vector == 0):
@@ -332,7 +327,7 @@ class DinoAgent:
                 obstacle = {}
                 next_obstacle = {}
 
-            # 提取障碍物相关信息，并归一化处理
+            # 基础特征
             obs_x = float(obstacle.get('x', 600))
             obs_width = float(obstacle.get('width', 20))
             obs_height = float(obstacle.get('height', 20))
@@ -340,16 +335,12 @@ class DinoAgent:
             speed = float(game_state.get('speed', 1))
             jumping = 1.0 if game_state.get('jumping', False) else 0.0
 
-            # 新增特征：障碍物类型标志
-            # 如果障碍物类型为 "pterodactyl" 或 "bird"，则置为 1；否则为 0
-            obs_type_str = str(obstacle.get('type', 'unknown')).lower()
-            obstacle_type = 1.0 if obs_type_str in ['pterodactyl', 'bird'] else 0.0
+            # 高级特征
+            time_to_collision = obs_x / (speed + 1e-6)
+            height_ratio = obs_height / 50.0
+            width_ratio = obs_width / 60.0
+            obstacle_density = len(obstacles) / 3.0
 
-            # 加速度特征：当前速度与上一时刻速度的变化率
-            acceleration = (speed - self.last_speed) / 5.0
-            self.last_speed = speed
-
-            # 构建状态向量，注意总共 10 个特征
             state_vector = np.array([
                 obs_x / 600.0,
                 obs_width / 60.0,
@@ -357,130 +348,207 @@ class DinoAgent:
                 next_x / 600.0,
                 speed / 13.0,
                 jumping,
-                acceleration,
-                (obs_x / speed) if speed > 0 else 0.0,
-                1.0 if obs_height > 40 else 0.0,
-                obstacle_type
+                time_to_collision / 10.0,
+                height_ratio,
+                width_ratio,
+                obstacle_density
             ], dtype=np.float32)
 
-            # 对状态向量进行数值清洗与裁剪
-            state_vector = np.nan_to_num(state_vector, nan=0.0, posinf=1.0, neginf=-1.0)
-            state_vector = np.clip(state_vector, -1.0, 1.0)
             return self.preprocess_state(state_vector)
         except Exception as e:
             print(f"状态转换错误: {e}")
-            # 注意，此处状态维度已改为 10
             return np.zeros(10)
 
-    def act(self, state_vector):
-        # 当随机数小于 ε 时，随机选择动作
+    def act(self, state):
         if np.random.rand() <= self.epsilon:
-            return np.random.choice([True, False])
-        q_values = self.model.predict(state_vector.reshape(1, -1), verbose=0)[0]
+            return bool(np.random.choice([True, False]))
+
+        state = np.array(state).reshape(1, -1)
+        q_values = self.model.predict(state, verbose=0)[0]
+        self.q_values.append(np.mean(q_values))
+
+        # 添加探索噪声
+        if np.random.rand() < self.exploration_noise:
+            q_values += np.random.normal(0, 0.1, size=q_values.shape)
+
         return bool(np.argmax(q_values))
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.add((state, action, reward, next_state, done))
+        self.update_reward_scale(reward)
 
     def train(self):
         if len(self.memory) < self.batch_size:
             return 0
-        minibatch, indices = self.memory.sample(self.batch_size)
-        if not minibatch:
-            return 0
+
+        # 使用优先级采样
+        minibatch, indices, weights = self.memory.sample(self.batch_size, self.per_beta)
 
         states = np.array([exp[0] for exp in minibatch])
+        actions = np.array([exp[1] for exp in minibatch])
+        rewards = np.array([exp[2] for exp in minibatch])
         next_states = np.array([exp[3] for exp in minibatch])
+        dones = np.array([exp[4] for exp in minibatch])
 
-        q_current = self.model.predict(states, verbose=0)
-        q_next_online = self.model.predict(next_states, verbose=0)
-        q_next_target = self.target_model.predict(next_states, verbose=0)
+        with tf.GradientTape() as tape:
+            # 当前Q值
+            current_q = self.model(states, training=True)
+            target_q = current_q.numpy()
 
-        X, y = [], []
-        new_priorities = []
+            # 下一状态的Q值
+            next_q = self.target_model(next_states, training=False)
 
-        for i, (state, action, reward, next_state, done) in enumerate(minibatch):
-            target = reward
-            if not done:
-                next_action = np.argmax(q_next_online[i])
-                target += self.gamma * q_next_target[i][next_action]
-            target_f = q_current[i]
-            action_idx = 1 if action else 0
-            old_val = target_f[action_idx]
-            target_f[action_idx] = target
+            # 计算目标Q值
+            for i in range(self.batch_size):
+                if dones[i]:
+                    target_q[i][1 if actions[i] else 0] = rewards[i] * self.reward_scale
+                else:
+                    target_q[i][1 if actions[i] else 0] = (rewards[i] * self.reward_scale +
+                                                           self.gamma * np.max(next_q[i]))
 
-            td_error = abs(old_val - target)
-            new_priorities.append(td_error)
-            X.append(state)
-            y.append(target_f)
+            # 计算加权损失
+            losses = tf.square(target_q - current_q)
+            weighted_losses = tf.reduce_mean(weights * losses)
 
-        history = self.model.fit(
-            np.array(X),
-            np.array(y),
-            epochs=1,
-            batch_size=32,
-            verbose=0
-        )
-        loss = history.history['loss'][0]
-        self.memory.update_priorities(indices, new_priorities)
+        # 计算梯度
+        gradients = tape.gradient(weighted_losses, self.model.trainable_variables)
 
-        self.train_step += 1
-        if self.train_step % self.update_target_freq == 0:
-            self.update_target_model()
+        # 使用不同的优化器
+        if self.train_step % 2 == 0:
+            self.optimizer_fast.apply_gradients(zip(gradients, self.model.trainable_variables))
+        else:
+            self.optimizer_slow.apply_gradients(zip(gradients, self.model.trainable_variables))
 
-        # 每步衰减 ε
+        # 更新优先级
+        td_errors = np.abs(target_q - current_q.numpy())
+        priorities = np.mean(td_errors, axis=1)
+        self.memory.update_priorities(indices, priorities)
+
+        # 软更新目标网络
+        self.soft_update_target_model()
+
+        # 更新beta值
+        self.per_beta = min(1.0, self.per_beta + self.per_beta_increment)
+
+        # 衰减探索率
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-        return loss
+        self.train_step += 1
+        return float(weighted_losses.numpy())
+
+    def save_progress(self):
+        tf.keras.models.save_model(self.model, self.model_path)
+        state = {
+            'memory': self.memory.memory,
+            'priorities': self.memory.priorities,
+            'epsilon': self.epsilon,
+            'scores': self.scores,
+            'avg_rewards': self.avg_rewards,
+            'losses': self.losses,
+            'q_values': self.q_values,
+            'reward_scale': self.reward_scale,
+            'reward_history': list(self.reward_history)
+        }
+        with open(self.state_path, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"模型及训练状态已保存。当前ε={self.epsilon:.3f}")
+
+    def load_progress(self):
+        if os.path.exists(self.model_path) and os.path.exists(self.state_path):
+            try:
+                self.model = load_model(self.model_path)
+                self.target_model = clone_model(self.model)
+                self.target_model.set_weights(self.model.get_weights())
+
+                with open(self.state_path, 'rb') as f:
+                    state = pickle.load(f)
+
+                self.memory.memory = state['memory']
+                self.memory.priorities = state['priorities']
+                self.epsilon = state['epsilon']
+                self.scores = state['scores']
+                self.avg_rewards = state.get('avg_rewards', [])
+                self.losses = state.get('losses', [])
+                self.q_values = state.get('q_values', [])
+                self.reward_scale = state.get('reward_scale', 1.0)
+                self.reward_history = deque(state.get('reward_history', []), maxlen=1000)
+
+                print(f"加载进度成功: 已训练{len(self.scores)}回合，当前ε={self.epsilon:.3f}")
+            except Exception as e:
+                print(f"加载进度出错: {e}，将重新开始训练")
+        else:
+            print("未找到保存的进度，将从头开始训练。")
+
+    # -----------------------
+    # 改进的训练数据可视化
+    # -----------------------
 
 
-# -----------------------
-# 绘制训练数据
-# -----------------------
 def save_training_data(agent):
     scores = np.array(agent.scores)
     np.save('dino_scores.npy', scores)
 
-    plt.figure(figsize=(15, 5))
-    window_size = 10
-    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid') if len(
-        scores) >= window_size else scores
+    plt.figure(figsize=(20, 5))
 
-    plt.subplot(131)
+    # 得分曲线
+    plt.subplot(141)
+    window_size = 10
+    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid')
     plt.plot(scores, alpha=0.3, label='Score')
-    plt.plot(moving_avg, label=f'{window_size} Moving Avg')
+    plt.plot(moving_avg, label=f'{window_size}-MA')
     plt.title('Scores')
     plt.legend()
 
-    plt.subplot(132)
+    # 平均奖励
+    plt.subplot(142)
     if agent.avg_rewards:
-        plt.plot(agent.avg_rewards)
+        window_size = 10
+        moving_avg = np.convolve(agent.avg_rewards, np.ones(window_size) / window_size, mode='valid')
+        plt.plot(agent.avg_rewards, alpha=0.3, label='Reward')
+        plt.plot(moving_avg, label=f'{window_size}-MA')
         plt.title('Average Rewards')
+        plt.legend()
 
-    plt.subplot(133)
+    # 训练损失
+    plt.subplot(143)
     if agent.losses:
-        plt.plot(agent.losses)
+        window_size = 10
+        moving_avg = np.convolve(agent.losses, np.ones(window_size) / window_size, mode='valid')
+        plt.plot(agent.losses, alpha=0.3, label='Loss')
+        plt.plot(moving_avg, label=f'{window_size}-MA')
         plt.title('Training Loss')
+        plt.legend()
+
+    # 平均Q值
+    plt.subplot(144)
+    if agent.q_values:
+        window_size = 10
+        moving_avg = np.convolve(agent.q_values, np.ones(window_size) / window_size, mode='valid')
+        plt.plot(agent.q_values, alpha=0.3, label='Q-Value')
+        plt.plot(moving_avg, label=f'{window_size}-MA')
+        plt.title('Average Q-Values')
+        plt.legend()
 
     plt.tight_layout()
     plt.savefig('training_metrics.png')
     plt.close()
 
+    # -----------------------
+    # 主训练循环
+    # -----------------------
 
-# -----------------------
-# 主训练流程，包含 ε 重启与动态调整学习率策略
-# -----------------------
+
 def main():
     env = DinoEnv(headless=True)
     agent = DinoAgent(state_size=10, action_size=2)
     episodes = 10000
-    max_steps_per_episode = 1000
+    max_steps_per_episode = 2000
 
-    # 用于监控最近 N 回合平均得分，用来判断是否需要重启 ε
+    # 训练监控参数
     monitor_window = 20
-    best_recent_avg = -float('inf')
-    prev_loss = None  # 用于记录上一个监控窗口的平均损失
+    best_reward = -float('inf')
+    no_improvement_count = 0
 
     try:
         for episode in range(len(agent.scores) + 1, episodes + 1):
@@ -491,22 +559,22 @@ def main():
             done = False
             step = 0
 
-            game_state = env.get_game_state()
-            state = agent.get_state_vector(game_state)
+            state = agent.get_state_vector(env.get_game_state())
 
             while not done and step < max_steps_per_episode:
                 action = agent.act(state)
                 next_game_state, reward, done, info = env.step(action)
                 next_state = agent.get_state_vector(next_game_state)
+
                 agent.remember(state, action, reward, next_state, done)
                 loss = agent.train()
+
                 if loss:
                     episode_losses.append(loss)
+
                 episode_reward += reward
                 state = next_state
                 step += 1
-                if done:
-                    break
 
             score = info.get('score', 0)
             agent.scores.append(score)
@@ -515,36 +583,38 @@ def main():
             avg_loss = np.mean(episode_losses) if episode_losses else 0
             agent.losses.append(avg_loss)
 
-            print(
-                f"回合 {episode} 结束 - 得分: {score} | 平均奖励: {avg_reward:.2f} | 平均损失: {avg_loss:.4f} | 探索率: {agent.epsilon:.3f}")
+            print(f"回合 {episode} - 得分: {score} | 步数: {step} | "
+                  f"平均奖励: {avg_reward:.2f} | ε: {agent.epsilon:.3f} | "
+                  f"奖励比例: {agent.reward_scale:.2f}")
 
-            # 每 monitor_window 回合后检查最近得分的平均值和平均损失
+            # 检查性能
             if episode % monitor_window == 0:
-                recent_avg = np.mean(agent.scores[-monitor_window:])
-                print(f"最近 {monitor_window} 回合平均得分: {recent_avg:.2f}")
-                if best_recent_avg != -float('inf') and recent_avg < best_recent_avg * 0.9:
-                    agent.epsilon = max(0.2, agent.epsilon * 2)
-                    print("检测到性能下降，临时提升探索率!")
+                recent_rewards = agent.avg_rewards[-monitor_window:]
+                avg_recent_reward = np.mean(recent_rewards)
+
+                if avg_recent_reward > best_reward:
+                    best_reward = avg_recent_reward
+                    no_improvement_count = 0
+                    agent.save_progress()
                 else:
-                    best_recent_avg = max(best_recent_avg, recent_avg)
+                    no_improvement_count += 1
 
-                # 动态调整学习率
-                recent_loss = np.mean(agent.losses[-monitor_window:])
-                if prev_loss is not None and recent_loss > prev_loss * 1.1:
-                    # 如果最近平均损失比上一个窗口高出10%，降低学习率 10%
-                    new_lr = agent.learning_rate * 0.9
-                    agent.learning_rate = max(new_lr, 1e-5)
-                    # 直接使用 assign 方法更新优化器学习率
-                    agent.model.optimizer.learning_rate.assign(agent.learning_rate)
-                    print(f"降低学习率到: {agent.learning_rate:.6f}")
-                prev_loss = recent_loss
+                # 如果长期没有改善，增加探索
+                if no_improvement_count >= 5:
+                    agent.epsilon = min(0.5, agent.epsilon * 1.5)
+                    agent.exploration_noise *= 1.2
+                    no_improvement_count = 0
+                    print("检测到性能停滞，增加探索!")
 
-            # 定期保存模型与训练数据
-            if episode % 10 == 0:
-                agent.save_progress()
+                print(f"最近{monitor_window}回合平均奖励: {avg_recent_reward:.2f}")
                 save_training_data(agent)
+
+            # 定期保存
+            if episode % 50 == 0:
+                agent.save_progress()
+
     except KeyboardInterrupt:
-        print("\n训练中断，正在保存进度...")
+        print("\n训练中断，正在保存...")
         agent.save_progress()
         save_training_data(agent)
     finally:
