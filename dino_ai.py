@@ -15,7 +15,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 import tensorflow as tf
-from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.models import Model, load_model, clone_model
 from tensorflow.keras.layers import Dense, Input, BatchNormalization, Dropout, Add, Activation
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import backend as K
