@@ -46,7 +46,7 @@ class PrioritizedReplayBuffer:
         scaled_priorities = priorities ** self.alpha
         probs = scaled_priorities / np.sum(scaled_priorities)
 
-        # 计算重要性权重
+        # 计算重要性采样权重
         weights = (len(self.memory) * probs) ** (-beta)
         weights = weights / np.max(weights)  # 归一化权重
 
@@ -56,18 +56,11 @@ class PrioritizedReplayBuffer:
         if len(self.memory) == 0:
             return [], [], []
 
-        # 确保batch_size不超过内存大小
         batch_size = min(batch_size, len(self.memory))
-
         probs, weights = self.get_probabilities(beta)
-
-        # 采样索引
         indices = np.random.choice(len(self.memory), batch_size, p=probs, replace=False)
-
-        # 获取对应的样本和权重
         samples = [self.memory[idx] for idx in indices]
         sample_weights = weights[indices]
-
         return samples, indices, sample_weights
 
     def update_priorities(self, indices, priorities):
@@ -80,7 +73,7 @@ class PrioritizedReplayBuffer:
 
 
 # -----------------------
-# Dino游戏环境（保持不变）
+# Dino游戏环境
 # -----------------------
 class DinoEnv:
     def __init__(self, headless=True):
@@ -138,10 +131,8 @@ class DinoEnv:
     def calculate_reward(self, state, score):
         """改进的奖励计算"""
         reward = 0.0
-
         # 基础生存奖励
         reward += 0.1
-
         # 基于速度的奖励
         speed = state.get('speed', 0)
         reward += speed * 0.01
@@ -150,15 +141,13 @@ class DinoEnv:
         if obstacles:
             obstacle = obstacles[0]
             distance = float(obstacle.get('x', 600))
-
-            # 根据距离给予奖励
             if distance < 100:  # 非常近
-                if state.get('jumping', False):  # 正确的跳跃
+                if state.get('jumping', False):  # 正确跳跃
                     reward += 15
-                else:  # 危险的不跳
+                else:
                     reward -= 20
             elif distance < 200:  # 中等距离
-                if state.get('jumping', False):  # 过早跳跃
+                if state.get('jumping', False):
                     reward -= 5
                 else:
                     reward += 5
@@ -233,10 +222,10 @@ class DinoAgent:
         self.action_size = action_size
 
         # 核心超参数
-        self.gamma = 0.99  # 折扣因子
-        self.learning_rate = 0.0001  # 基础学习率
-        self.batch_size = 128  # 增大batch size
-        self.tau = 0.001  # 软更新系数
+        self.gamma = 0.99             # 折扣因子
+        self.learning_rate = 0.0001     # 学习率
+        self.batch_size = 128         # 批大小
+        self.tau = 0.005              # 增大软更新系数
 
         # 探索相关参数
         self.epsilon = 1.0
@@ -249,11 +238,10 @@ class DinoAgent:
         self.per_beta = 0.4
         self.per_beta_increment = 0.001
 
-        # 创建优化器
-        self.optimizer_fast = Adam(learning_rate=self.learning_rate * 2)
-        self.optimizer_slow = Adam(learning_rate=self.learning_rate)
+        # 统一使用单一优化器
+        self.optimizer = Adam(learning_rate=self.learning_rate)
 
-        # 神经网络与优化器
+        # 创建模型和目标模型
         self.model = self._build_model()
         self.target_model = self._build_model()
         self.target_model.set_weights(self.model.get_weights())
@@ -281,7 +269,6 @@ class DinoAgent:
 
     def _build_model(self):
         inputs = Input(shape=(self.state_size,))
-
         # 第一层特征提取
         x = Dense(128, activation='relu')(inputs)
         x = BatchNormalization()(x)
@@ -303,7 +290,7 @@ class DinoAgent:
         outputs = Dense(self.action_size, activation='linear')(x)
 
         model = Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=self.optimizer_fast, loss='huber')
+        model.compile(optimizer=self.optimizer, loss='huber')
         return model
 
     def soft_update_target_model(self):
@@ -391,11 +378,9 @@ class DinoAgent:
 
         # 使用优先级采样
         minibatch, indices, weights = self.memory.sample(self.batch_size, self.per_beta)
-
-        if not minibatch:  # 检查是否为空
+        if not minibatch:
             return 0
 
-        # 确保所有数组的长度一致
         batch_size = len(minibatch)
         weights = np.array(weights, dtype=np.float32)
 
@@ -419,31 +404,20 @@ class DinoAgent:
             # 计算目标Q值
             for i in range(batch_size):
                 if dones[i]:
-                    target_q[i] = current_q[i].numpy()
                     target_q[i][1 if actions[i] else 0] = rewards[i] * self.reward_scale
                 else:
-                    target_q[i] = current_q[i].numpy()
                     target_q[i][1 if actions[i] else 0] = (rewards[i] * self.reward_scale +
                                                            self.gamma * np.max(next_q[i]))
 
             # 计算损失
             losses = tf.reduce_sum(tf.square(target_q - current_q) * action_mask, axis=1)
-
-            # 确保weights形状正确
-            weights = tf.reshape(weights, [-1])  # 展平权重数组
-            losses = tf.reshape(losses, [-1])  # 展平损失数组
-
-            # 应用样本权重并计算平均损失
+            weights = tf.reshape(weights, [-1])
+            losses = tf.reshape(losses, [-1])
             weighted_losses = tf.reduce_mean(weights * losses)
 
-        # 计算梯度
+        # 计算梯度并更新
         gradients = tape.gradient(weighted_losses, self.model.trainable_variables)
-
-        # 使用不同的优化器
-        if self.train_step % 2 == 0:
-            self.optimizer_fast.apply_gradients(zip(gradients, self.model.trainable_variables))
-        else:
-            self.optimizer_slow.apply_gradients(zip(gradients, self.model.trainable_variables))
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
 
         # 更新优先级
         td_errors = np.abs(target_q - current_q.numpy())
@@ -506,11 +480,10 @@ class DinoAgent:
         else:
             print("未找到保存的进度，将从头开始训练。")
 
-    # -----------------------
-    # 改进的训练数据可视化
-    # -----------------------
 
-
+# -----------------------
+# 训练数据可视化
+# -----------------------
 def save_training_data(agent):
     scores = np.array(agent.scores)
     np.save('dino_scores.npy', scores)
@@ -560,11 +533,10 @@ def save_training_data(agent):
     plt.savefig('training_metrics.png')
     plt.close()
 
-    # -----------------------
-    # 主训练循环
-    # -----------------------
 
-
+# -----------------------
+# 主训练循环
+# -----------------------
 def main():
     env = DinoEnv(headless=True)
     agent = DinoAgent(state_size=10, action_size=2)
@@ -594,7 +566,6 @@ def main():
 
                 agent.remember(state, action, reward, next_state, done)
                 loss = agent.train()
-
                 if loss:
                     episode_losses.append(loss)
 
@@ -609,11 +580,8 @@ def main():
             avg_loss = np.mean(episode_losses) if episode_losses else 0
             agent.losses.append(avg_loss)
 
-            print(f"回合 {episode} - 得分: {score} | 步数: {step} | "
-                  f"平均奖励: {avg_reward:.2f} | ε: {agent.epsilon:.3f} | "
-                  f"奖励比例: {agent.reward_scale:.2f}")
+            print(f"回合 {episode} - 得分: {score} | 步数: {step} | 平均奖励: {avg_reward:.2f} | ε: {agent.epsilon:.3f} | 奖励比例: {agent.reward_scale:.2f}")
 
-            # 检查性能
             if episode % monitor_window == 0:
                 recent_rewards = agent.avg_rewards[-monitor_window:]
                 avg_recent_reward = np.mean(recent_rewards)
@@ -625,17 +593,16 @@ def main():
                 else:
                     no_improvement_count += 1
 
-                # 如果长期没有改善，增加探索
+                # 如果长期没有改善，适度增加探索
                 if no_improvement_count >= 5:
-                    agent.epsilon = min(0.5, agent.epsilon * 1.5)
-                    agent.exploration_noise *= 1.2
+                    agent.epsilon = min(0.6, agent.epsilon * 1.1)
+                    agent.exploration_noise *= 1.1
                     no_improvement_count = 0
-                    print("检测到性能停滞，增加探索!")
+                    print("检测到性能停滞，适度增加探索!")
 
                 print(f"最近{monitor_window}回合平均奖励: {avg_recent_reward:.2f}")
                 save_training_data(agent)
 
-            # 定期保存
             if episode % 50 == 0:
                 agent.save_progress()
 
