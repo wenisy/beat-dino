@@ -214,7 +214,7 @@ class DinoEnv:
 
 
 # -----------------------
-# 改进的Dino AI代理
+# Double DQN 版 Dino AI代理
 # -----------------------
 class DinoAgent:
     def __init__(self, state_size=10, action_size=2):
@@ -222,10 +222,10 @@ class DinoAgent:
         self.action_size = action_size
 
         # 核心超参数
-        self.gamma = 0.99             # 折扣因子
-        self.learning_rate = 0.0001     # 学习率
+        self.gamma = 0.98             # <--- 调低折扣因子
+        self.learning_rate = 0.0001   # 学习率可根据需要再调小
         self.batch_size = 128         # 批大小
-        self.tau = 0.005              # 增大软更新系数
+        self.tau = 0.01              # <--- 增大软更新系数
 
         # 探索相关参数
         self.epsilon = 1.0
@@ -238,8 +238,8 @@ class DinoAgent:
         self.per_beta = 0.4
         self.per_beta_increment = 0.001
 
-        # 统一使用单一优化器
-        self.optimizer = Adam(learning_rate=self.learning_rate)
+        # 使用单一优化器 + 梯度裁剪
+        self.optimizer = Adam(learning_rate=self.learning_rate, clipnorm=1.0)
 
         # 创建模型和目标模型
         self.model = self._build_model()
@@ -303,8 +303,9 @@ class DinoAgent:
     def update_reward_scale(self, reward):
         self.reward_history.append(abs(reward))
         if len(self.reward_history) >= 100:
+            # 将动态缩放限制在 [0.2, 5.0] 之间
             scale = 1.0 / (np.mean(self.reward_history) + 1e-6)
-            self.reward_scale = min(max(scale, 0.1), 10.0)
+            self.reward_scale = min(max(scale, 0.2), 5.0)
 
     def preprocess_state(self, state_vector):
         if np.all(state_vector == 0):
@@ -352,9 +353,10 @@ class DinoAgent:
             return self.preprocess_state(state_vector)
         except Exception as e:
             print(f"状态转换错误: {e}")
-            return np.zeros(10)
+            return np.zeros(self.state_size)
 
     def act(self, state):
+        # Epsilon-greedy
         if np.random.rand() <= self.epsilon:
             return bool(np.random.choice([True, False]))
 
@@ -391,25 +393,30 @@ class DinoAgent:
         dones = np.array([exp[4] for exp in minibatch])
 
         with tf.GradientTape() as tape:
-            # 当前Q值
             current_q = self.model(states, training=True)
             target_q = current_q.numpy()
 
-            # 下一状态的Q值
-            next_q = self.target_model(next_states, training=False)
+            # Double DQN：先用主网络选出下一步动作，再用目标网络估算Q
+            # 主网络选动作
+            next_actions = np.argmax(self.model(next_states, training=False), axis=1)
+            # 目标网络估值
+            next_q_target = self.target_model(next_states, training=False)
 
-            # 创建动作掩码 (one-hot)
+            # 动作掩码 (one-hot)
             action_mask = tf.one_hot(tf.cast(actions, tf.int32), self.action_size)
 
-            # 计算目标Q值
             for i in range(batch_size):
                 if dones[i]:
+                    # 回合结束
                     target_q[i][1 if actions[i] else 0] = rewards[i] * self.reward_scale
                 else:
-                    target_q[i][1 if actions[i] else 0] = (rewards[i] * self.reward_scale +
-                                                           self.gamma * np.max(next_q[i]))
+                    # Double DQN更新
+                    a_next = next_actions[i]
+                    q_double = next_q_target[i][a_next]
+                    target_q[i][1 if actions[i] else 0] = (
+                        rewards[i] * self.reward_scale + self.gamma * q_double
+                    )
 
-            # 计算损失
             losses = tf.reduce_sum(tf.square(target_q - current_q) * action_mask, axis=1)
             weights = tf.reshape(weights, [-1])
             losses = tf.reshape(losses, [-1])
@@ -493,9 +500,12 @@ def save_training_data(agent):
     # 得分曲线
     plt.subplot(141)
     window_size = 10
-    moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid')
-    plt.plot(scores, alpha=0.3, label='Score')
-    plt.plot(moving_avg, label=f'{window_size}-MA')
+    if len(scores) >= window_size:
+        moving_avg = np.convolve(scores, np.ones(window_size) / window_size, mode='valid')
+        plt.plot(scores, alpha=0.3, label='Score')
+        plt.plot(range(window_size - 1, len(scores)), moving_avg, label=f'{window_size}-MA')
+    else:
+        plt.plot(scores, label='Score')
     plt.title('Scores')
     plt.legend()
 
@@ -503,9 +513,13 @@ def save_training_data(agent):
     plt.subplot(142)
     if agent.avg_rewards:
         window_size = 10
-        moving_avg = np.convolve(agent.avg_rewards, np.ones(window_size) / window_size, mode='valid')
-        plt.plot(agent.avg_rewards, alpha=0.3, label='Reward')
-        plt.plot(moving_avg, label=f'{window_size}-MA')
+        avg_r = np.array(agent.avg_rewards)
+        if len(avg_r) >= window_size:
+            moving_avg_r = np.convolve(avg_r, np.ones(window_size) / window_size, mode='valid')
+            plt.plot(avg_r, alpha=0.3, label='Reward')
+            plt.plot(range(window_size - 1, len(avg_r)), moving_avg_r, label=f'{window_size}-MA')
+        else:
+            plt.plot(avg_r, label='Reward')
         plt.title('Average Rewards')
         plt.legend()
 
@@ -513,9 +527,13 @@ def save_training_data(agent):
     plt.subplot(143)
     if agent.losses:
         window_size = 10
-        moving_avg = np.convolve(agent.losses, np.ones(window_size) / window_size, mode='valid')
-        plt.plot(agent.losses, alpha=0.3, label='Loss')
-        plt.plot(moving_avg, label=f'{window_size}-MA')
+        losses = np.array(agent.losses)
+        if len(losses) >= window_size:
+            moving_avg_l = np.convolve(losses, np.ones(window_size) / window_size, mode='valid')
+            plt.plot(losses, alpha=0.3, label='Loss')
+            plt.plot(range(window_size - 1, len(losses)), moving_avg_l, label=f'{window_size}-MA')
+        else:
+            plt.plot(losses, label='Loss')
         plt.title('Training Loss')
         plt.legend()
 
@@ -523,9 +541,13 @@ def save_training_data(agent):
     plt.subplot(144)
     if agent.q_values:
         window_size = 10
-        moving_avg = np.convolve(agent.q_values, np.ones(window_size) / window_size, mode='valid')
-        plt.plot(agent.q_values, alpha=0.3, label='Q-Value')
-        plt.plot(moving_avg, label=f'{window_size}-MA')
+        q_vals = np.array(agent.q_values)
+        if len(q_vals) >= window_size:
+            moving_avg_q = np.convolve(q_vals, np.ones(window_size) / window_size, mode='valid')
+            plt.plot(q_vals, alpha=0.3, label='Q-Value')
+            plt.plot(range(window_size - 1, len(q_vals)), moving_avg_q, label=f'{window_size}-MA')
+        else:
+            plt.plot(q_vals, label='Q-Value')
         plt.title('Average Q-Values')
         plt.legend()
 
@@ -582,9 +604,10 @@ def main():
 
             print(f"回合 {episode} - 得分: {score} | 步数: {step} | 平均奖励: {avg_reward:.2f} | ε: {agent.epsilon:.3f} | 奖励比例: {agent.reward_scale:.2f}")
 
+            # 监控窗口
             if episode % monitor_window == 0:
                 recent_rewards = agent.avg_rewards[-monitor_window:]
-                avg_recent_reward = np.mean(recent_rewards)
+                avg_recent_reward = np.mean(recent_rewards) if len(recent_rewards) > 0 else 0
 
                 if avg_recent_reward > best_reward:
                     best_reward = avg_recent_reward
@@ -603,6 +626,7 @@ def main():
                 print(f"最近{monitor_window}回合平均奖励: {avg_recent_reward:.2f}")
                 save_training_data(agent)
 
+            # 定期保存
             if episode % 50 == 0:
                 agent.save_progress()
 
