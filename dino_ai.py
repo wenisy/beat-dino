@@ -553,8 +553,8 @@ def main():
 
     monitor_window = 20
     no_improvement_count = 0
-    # 定义一个分数下降阈值 delta，当当前得分比历史最佳低超过 delta 时触发回滚
-    delta = 1.0
+    # 定义相对退化阈值：当当前得分低于历史最佳得分的 (1 - relative_threshold) 时触发回滚
+    relative_threshold = 0.10  # 即当前得分低于 90% 的最佳得分
 
     try:
         for episode in range(len(agent.scores) + 1, episodes + 1):
@@ -597,8 +597,9 @@ def main():
                 agent.save_best_model(score)
                 no_improvement_count = 0
             else:
-                if (agent.best_score - score) > delta:
-                    print(f"检测到明显退化: 当前得分 {score} 低于最佳 {agent.best_score} 超过 {delta}")
+                # 如果当前得分低于历史最佳得分的 (1 - relative_threshold) 则触发回滚
+                if score < (1 - relative_threshold) * agent.best_score:
+                    print(f"检测到明显退化: 当前得分 {score} 低于最佳 {agent.best_score} 的 {(1-relative_threshold)*100:.0f}%")
                     agent.load_best_model()
                 no_improvement_count += 1
 
