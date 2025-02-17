@@ -129,11 +129,8 @@ class DinoEnv:
         return state, reward, done, info
 
     def calculate_reward(self, state, score):
-        """改进的奖励计算"""
         reward = 0.0
-        # 基础生存奖励
         reward += 0.1
-        # 基于速度的奖励
         speed = state.get('speed', 0)
         reward += speed * 0.01
 
@@ -141,18 +138,17 @@ class DinoEnv:
         if obstacles:
             obstacle = obstacles[0]
             distance = float(obstacle.get('x', 600))
-            if distance < 100:  # 非常近
-                if state.get('jumping', False):  # 正确跳跃
+            if distance < 100:
+                if state.get('jumping', False):
                     reward += 15
                 else:
                     reward -= 20
-            elif distance < 200:  # 中等距离
+            elif distance < 200:
                 if state.get('jumping', False):
                     reward -= 5
                 else:
                     reward += 5
 
-        # 撞车惩罚
         if state.get('crashed', False):
             reward -= 100
 
@@ -221,19 +217,16 @@ class DinoAgent:
         self.state_size = state_size
         self.action_size = action_size
 
-        # 核心超参数
         self.gamma = 0.99
         self.learning_rate = 0.0001
         self.batch_size = 128
         self.tau = 0.005
 
-        # 探索相关参数
         self.epsilon = 1.0
         self.epsilon_min = 0.05
         self.epsilon_decay = 0.9995
         self.exploration_noise = 0.1
 
-        # 优先经验回放参数
         self.per_alpha = 0.6
         self.per_beta = 0.4
         self.per_beta_increment = 0.001
@@ -251,15 +244,15 @@ class DinoAgent:
         self.reward_scale = 1.0
         self.reward_history = deque(maxlen=1000)
 
-        # 性能指标记录
+        # 训练指标记录
         self.scores = []
         self.avg_rewards = []
         self.losses = []
         self.q_values = []
 
-        # 用于保存“最佳模型”
-        self.best_avg_reward = -float('inf')  # 历史最佳平均奖励
-        self.best_model_path = None           # 最佳模型路径
+        # 最佳模型基于单回合得分
+        self.best_score = -float('inf')
+        self.best_model_path = None  # 最佳模型存放路径
 
         # 模型保存路径
         self.save_dir = os.path.dirname(os.path.abspath(__file__))
@@ -274,7 +267,6 @@ class DinoAgent:
         x = BatchNormalization()(x)
         x = Dropout(0.1)(x)
 
-        # 残差块
         for _ in range(3):
             skip = x
             x = Dense(128, activation='relu')(x)
@@ -396,8 +388,9 @@ class DinoAgent:
                 if dones[i]:
                     target_q[i][1 if actions[i] else 0] = rewards[i] * self.reward_scale
                 else:
-                    target_q[i][1 if actions[i] else 0] = (rewards[i] * self.reward_scale +
-                                                           self.gamma * np.max(next_q[i]))
+                    target_q[i][1 if actions[i] else 0] = (
+                        rewards[i] * self.reward_scale + self.gamma * np.max(next_q[i])
+                    )
 
             losses = tf.reduce_sum(tf.square(target_q - current_q) * action_mask, axis=1)
             weights = tf.reshape(weights, [-1])
@@ -412,7 +405,6 @@ class DinoAgent:
         self.memory.update_priorities(indices, priorities)
 
         self.soft_update_target_model()
-
         self.per_beta = min(1.0, self.per_beta + self.per_beta_increment)
 
         if self.epsilon > self.epsilon_min:
@@ -422,45 +414,26 @@ class DinoAgent:
         return float(weighted_losses.numpy())
 
     # -----------------------
-    # 阶段性清理或重置缓冲区
-    # -----------------------
-    def clear_old_experiences(self, keep_ratio=0.5):
-        """只保留回放缓冲区中最近 keep_ratio 的数据，其他全部清除。"""
-        old_len = len(self.memory)
-        if old_len == 0:
-            return
-        keep_size = int(old_len * keep_ratio)
-        if keep_size <= 0:
-            # 全部清空
-            self.memory.memory.clear()
-            self.memory.priorities.clear()
-        else:
-            # 只保留最末尾的 keep_size 条
-            new_memory = deque(list(self.memory.memory)[-keep_size:], maxlen=self.memory.memory.maxlen)
-            new_priorities = deque(list(self.memory.priorities)[-keep_size:], maxlen=self.memory.priorities.maxlen)
-            self.memory.memory = new_memory
-            self.memory.priorities = new_priorities
-
-        print(f"[清理缓冲区] 原大小 {old_len} -> 新大小 {len(self.memory)} (保留比例 {keep_ratio})")
-
-    # -----------------------
     # 保存/加载最佳模型
     # -----------------------
-    def save_best_model(self, avg_reward):
-        """如果当前 avg_reward 更高，则保存为最佳模型。"""
-        if avg_reward > self.best_avg_reward:
-            self.best_avg_reward = avg_reward
+    def save_best_model(self, score):
+        # 修改条件为 >= ，确保首次更新也会保存
+        if score >= self.best_score:
+            self.best_score = score
             self.best_model_path = os.path.join(self.save_dir, 'best_model.keras')
             tf.keras.models.save_model(self.model, self.best_model_path)
-            print(f"[最佳模型] 已保存, 平均奖励: {avg_reward:.2f}")
+            print(f"[最佳模型] 已保存, 得分: {score}")
 
     def load_best_model(self):
-        """从best_model.keras中加载最佳模型，替换当前模型。"""
         if self.best_model_path and os.path.exists(self.best_model_path):
             self.model = load_model(self.best_model_path)
+            # 重新创建优化器并编译模型
+            self.optimizer = Adam(learning_rate=self.learning_rate)
+            self.model.compile(optimizer=self.optimizer, loss='huber')
+            # 更新目标网络
             self.target_model = clone_model(self.model)
             self.target_model.set_weights(self.model.get_weights())
-            print("[最佳模型] 已从 best_model.keras 中加载。")
+            print("[最佳模型] 已从 best_model.keras 中加载，并重新初始化了优化器。")
         else:
             print("[最佳模型] 未找到best_model.keras，无法加载。")
 
@@ -476,7 +449,7 @@ class DinoAgent:
             'q_values': self.q_values,
             'reward_scale': self.reward_scale,
             'reward_history': list(self.reward_history),
-            'best_avg_reward': self.best_avg_reward
+            'best_score': self.best_score
         }
         with open(self.state_path, 'wb') as f:
             pickle.dump(state, f)
@@ -501,18 +474,15 @@ class DinoAgent:
                 self.q_values = state.get('q_values', [])
                 self.reward_scale = state.get('reward_scale', 1.0)
                 self.reward_history = deque(state.get('reward_history', []), maxlen=1000)
-                self.best_avg_reward = state.get('best_avg_reward', -float('inf'))
+                self.best_score = state.get('best_score', -float('inf'))
 
-                print(f"加载进度成功: 已训练{len(self.scores)}回合，当前ε={self.epsilon:.3f}, 历史最佳平均奖励={self.best_avg_reward:.2f}")
+                print(f"加载进度成功: 已训练{len(self.scores)}回合，当前ε={self.epsilon:.3f}, 最佳得分={self.best_score}")
             except Exception as e:
                 print(f"加载进度出错: {e}，将重新开始训练")
         else:
             print("未找到保存的进度，将从头开始训练。")
 
 
-# -----------------------
-# 数据可视化
-# -----------------------
 def save_training_data(agent):
     scores = np.array(agent.scores)
     np.save('dino_scores.npy', scores)
@@ -575,9 +545,6 @@ def save_training_data(agent):
     plt.close()
 
 
-# -----------------------
-# 主训练循环
-# -----------------------
 def main():
     env = DinoEnv(headless=True)
     agent = DinoAgent(state_size=10, action_size=2)
@@ -586,8 +553,8 @@ def main():
 
     monitor_window = 20
     no_improvement_count = 0
-    # 你可以自行设置一个阈值，用于清理缓冲区
-    CLEAR_THRESHOLD = 3.0  # 当最近的平均奖励 > 3.0，就清理缓冲区(示例)
+    # 定义一个分数下降阈值 delta，当当前得分比历史最佳低超过 delta 时触发回滚
+    delta = 1.0
 
     try:
         for episode in range(len(agent.scores) + 1, episodes + 1):
@@ -624,39 +591,28 @@ def main():
             print(f"回合 {episode} - 得分: {score} | 步数: {step} | 平均奖励: {avg_reward:.2f} | "
                   f"ε: {agent.epsilon:.3f} | 奖励比例: {agent.reward_scale:.2f}")
 
-            # 监控窗口
+            # 根据每回合得分判断是否更新最佳模型或回滚
+            if score >= agent.best_score:
+                agent.best_score = score
+                agent.save_best_model(score)
+                no_improvement_count = 0
+            else:
+                if (agent.best_score - score) > delta:
+                    print(f"检测到明显退化: 当前得分 {score} 低于最佳 {agent.best_score} 超过 {delta}")
+                    agent.load_best_model()
+                no_improvement_count += 1
+
+            # 如果连续多次没有改善，则适当增加探索
+            if no_improvement_count >= 5:
+                agent.epsilon = min(0.6, agent.epsilon * 1.1)
+                agent.exploration_noise *= 1.1
+                no_improvement_count = 0
+                print("检测到性能停滞，适度增加探索!")
+
+            # 定期保存数据
             if episode % monitor_window == 0:
-                recent_rewards = agent.avg_rewards[-monitor_window:]
-                avg_recent_reward = np.mean(recent_rewards) if len(recent_rewards) > 0 else 0
-
-                # 保存当前进度
                 agent.save_progress()
-
-                # 判断是否是新的“最佳平均奖励”
-                agent.save_best_model(avg_recent_reward)
-
-                # 如果最近没有改善，增加探索
-                if avg_recent_reward <= agent.best_avg_reward:
-                    no_improvement_count += 1
-                else:
-                    no_improvement_count = 0
-
-                if no_improvement_count >= 5:
-                    agent.epsilon = min(0.6, agent.epsilon * 1.1)
-                    agent.exploration_noise *= 1.1
-                    no_improvement_count = 0
-                    print("检测到性能停滞，适度增加探索!")
-
-                # 这里可以进行阶段性清理缓冲区的逻辑
-                if avg_recent_reward > CLEAR_THRESHOLD:
-                    agent.clear_old_experiences(keep_ratio=0.2)  # 只保留 20% 最新数据
-
-                print(f"最近{monitor_window}回合平均奖励: {avg_recent_reward:.2f}")
                 save_training_data(agent)
-
-            # 定期保存
-            if episode % 50 == 0:
-                agent.save_progress()
 
     except KeyboardInterrupt:
         print("\n训练中断，正在保存...")
